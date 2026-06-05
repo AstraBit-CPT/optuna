@@ -1393,6 +1393,41 @@ def test_ask_batch_uses_native_sampler_batch_for_fixed_search_space() -> None:
         assert study.trials[trial.number].params == params
 
 
+def test_ask_batch_records_duplicate_suggestion_diagnostics() -> None:
+    class DuplicateBatchSampler(optuna.samplers.RandomSampler):
+        def sample_batch(
+            self,
+            study: Study,
+            trials: Sequence[FrozenTrial],
+            search_space: dict[str, distributions.BaseDistribution],
+        ) -> list[dict[str, Any]]:
+            return [
+                {"x": 0.1, "y": 0},
+                {"x": 0.1, "y": 0},
+                {"x": 0.105, "y": 0},
+                {"x": 0.5, "y": 3},
+            ]
+
+    fixed_distributions = {
+        "x": distributions.FloatDistribution(0, 1),
+        "y": distributions.IntDistribution(0, 10),
+    }
+    study = create_study(sampler=DuplicateBatchSampler())
+
+    with pytest.warns(ExperimentalWarning):
+        result = study.ask_batch(4, fixed_distributions=fixed_distributions)
+
+    diagnostics = result.metadata.suggestion_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.evaluated_count == 4
+    assert diagnostics.pair_count == 6
+    assert diagnostics.duplicate_pair_count == 1
+    assert diagnostics.duplicate_rate == pytest.approx(1 / 6)
+    assert diagnostics.near_duplicate_pair_count == 2
+    assert diagnostics.near_duplicate_rate == pytest.approx(2 / 6)
+    assert diagnostics.near_duplicate_threshold == 0.01
+
+
 def test_ask_batch_uses_native_tpe_sampler_batch_for_fixed_search_space() -> None:
     fixed_distributions = {
         "x": distributions.FloatDistribution(0, 1),
@@ -1428,6 +1463,7 @@ def test_ask_batch_without_fixed_search_space_does_not_use_native_sampler_batch(
     assert result.metadata.fallback_mode is BatchFallbackMode.REPEATED_SINGLE_SUGGESTION
     assert result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.NATIVE
     assert result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.FALLBACK
+    assert result.metadata.suggestion_diagnostics is None
 
 
 def test_ask_batch_uses_storage_batch_reservation_for_new_trials() -> None:

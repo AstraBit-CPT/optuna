@@ -43,6 +43,7 @@ from optuna.study._batch import BatchTellResult
 from optuna.study._batch import BatchTellStatus
 from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import BatchTrialLease
+from optuna.study._batch import calculate_batch_suggestion_diagnostics
 from optuna.study._batch import create_batch_trial_lease
 from optuna.study._batch import fallback_batch_capability
 from optuna.study._batch import get_batch_capability
@@ -741,6 +742,9 @@ class Study:
             returned_count=len(trial_handles),
             capability=capability,
             fallback_mode=fallback_mode,
+            suggestion_diagnostics=calculate_batch_suggestion_diagnostics(
+                [trial.params for trial in trials], fixed_distributions
+            ),
         )
         return BatchAskResult(trial_handles=trial_handles, metadata=metadata)
 

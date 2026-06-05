@@ -20,7 +20,7 @@
 - [x] 3.2 Implement default compatibility behavior for samplers without native batch support.
 - [x] 3.3 Implement native pending-aware TPE batch suggestion that preserves `constant_liar` RUNNING-trial semantics.
 - [x] 3.4 Ensure later in-batch suggestions account for earlier in-batch pending candidates.
-- [ ] 3.5 Add duplicate and near-duplicate metrics for batched sampler output.
+- [x] 3.5 Add duplicate and near-duplicate metrics for batched sampler output.
 - [x] 3.6 Add sampler tests comparing native batch behavior with repeated single-suggestion fallback behavior.
 
 ## 4. Batch Completion and Idempotency
