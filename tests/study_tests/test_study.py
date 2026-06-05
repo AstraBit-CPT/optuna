@@ -38,10 +38,13 @@ from optuna import TrialPruned
 from optuna.exceptions import DuplicatedStudyError
 from optuna.exceptions import ExperimentalWarning
 from optuna.study import StudyDirection
+from optuna.study._batch import _BATCH_RESOURCE_ASSIGNMENT_ATTR
 from optuna.study._batch import _BATCH_TRIAL_COMPLETION_ATTR
+from optuna.study._batch import _BATCH_TRIAL_GENERATION_ATTR
 from optuna.study._batch import _BATCH_TRIAL_LEASE_ATTR
 from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
+from optuna.study._batch import BatchGeneratorMode
 from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellStatus
 from optuna.study._batch_queue import _BATCH_QUEUE_ENTRY_ATTR
@@ -1449,6 +1452,61 @@ def test_ask_batch_records_sampler_snapshot_id() -> None:
     assert result1.metadata.sampler_snapshot_id != snapshot_id0
 
 
+def test_ask_batch_random_generator_mode_records_generation_metadata() -> None:
+    class ConfiguredBatchSampler(optuna.samplers.RandomSampler):
+        def sample_batch(
+            self,
+            study: Study,
+            trials: Sequence[FrozenTrial],
+            search_space: dict[str, distributions.BaseDistribution],
+        ) -> list[dict[str, Any]]:
+            return [{"x": 0.99, "y": 9} for _ in trials]
+
+    fixed_distributions = {
+        "x": distributions.FloatDistribution(0, 1),
+        "y": distributions.IntDistribution(0, 10),
+    }
+    study = create_study(sampler=ConfiguredBatchSampler(seed=999))
+
+    with patch.object(study.sampler, "sample_batch", wraps=study.sampler.sample_batch) as mock:
+        with pytest.warns(ExperimentalWarning):
+            result = study.ask_batch(
+                3,
+                fixed_distributions=fixed_distributions,
+                generator_mode=BatchGeneratorMode.RANDOM,
+                generator_seed=7,
+            )
+
+    params_batch = [trial.params for trial in result.trials]
+    assert mock.call_count == 0
+    assert result.metadata.generator_mode is BatchGeneratorMode.RANDOM
+    assert result.metadata.generator_seed == 7
+    assert result.metadata.fallback_mode is BatchFallbackMode.NONE
+    assert result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.NATIVE
+    assert params_batch != [{"x": 0.99, "y": 9}] * 3
+
+    generation_attrs = [
+        trial.system_attrs[_BATCH_TRIAL_GENERATION_ATTR] for trial in study.trials
+    ]
+    assert [attr["batch_id"] for attr in generation_attrs] == [result.metadata.batch_id] * 3
+    assert [attr["generator_mode"] for attr in generation_attrs] == ["random"] * 3
+    assert [attr["generator_seed"] for attr in generation_attrs] == [7] * 3
+    assert [
+        attr["sampler_snapshot_id"] for attr in generation_attrs
+    ] == [result.metadata.sampler_snapshot_id] * 3
+
+    reproducible_study = create_study(sampler=ConfiguredBatchSampler(seed=123))
+    with pytest.warns(ExperimentalWarning):
+        reproducible_result = reproducible_study.ask_batch(
+            3,
+            fixed_distributions=fixed_distributions,
+            generator_mode="random",
+            generator_seed=7,
+        )
+
+    assert [trial.params for trial in reproducible_result.trials] == params_batch
+
+
 def test_ask_batch_uses_native_tpe_sampler_batch_for_fixed_search_space() -> None:
     fixed_distributions = {
         "x": distributions.FloatDistribution(0, 1),
@@ -1624,6 +1682,43 @@ def test_ask_batch_lease_argument_validation() -> None:
         )
 
 
+def test_ask_batch_generator_mode_argument_validation() -> None:
+    study = create_study()
+    fixed_distributions = {"x": distributions.FloatDistribution(0, 1)}
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.ask_batch(1, generator_mode="random")
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(TypeError):
+        study.ask_batch(
+            1,
+            fixed_distributions=fixed_distributions,
+            generator_mode=1,  # type: ignore[arg-type]
+        )
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.ask_batch(
+            1,
+            fixed_distributions=fixed_distributions,
+            generator_mode="unknown",
+        )
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(TypeError):
+        study.ask_batch(
+            1,
+            fixed_distributions=fixed_distributions,
+            generator_mode="random",
+            generator_seed=1.0,  # type: ignore[arg-type]
+        )
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.ask_batch(
+            1,
+            fixed_distributions=fixed_distributions,
+            generator_seed=7,
+        )
+
+
 def test_batch_candidate_queue_refill_respects_bounds() -> None:
     study = create_study()
     with pytest.warns(ExperimentalWarning):
@@ -1689,6 +1784,53 @@ def test_batch_candidate_queue_acquire_ready_candidate_without_refill() -> None:
     assert tell_result.metadata.completed_count == 1
     assert tell_result.outcomes[0].status is BatchTellStatus.ACCEPTED
     assert queue.inflight_count == 0
+
+
+def test_batch_candidate_queue_records_generator_and_resource_assignment_metadata() -> None:
+    fixed_distributions = {"x": distributions.FloatDistribution(0, 1)}
+    study = create_study(sampler=optuna.samplers.TPESampler(seed=0))
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=2,
+            max_queue_size=2,
+            max_inflight=2,
+            fixed_distributions=fixed_distributions,
+            generator_mode="random",
+            generator_seed=11,
+        )
+
+    with patch.object(study.sampler, "sample_batch", wraps=study.sampler.sample_batch) as mock:
+        with pytest.warns(ExperimentalWarning):
+            refill = queue.refill()
+
+    assert mock.call_count == 0
+    assert refill.ask_metadata is not None
+    assert refill.ask_metadata.generator_mode is BatchGeneratorMode.RANDOM
+    assert refill.ask_metadata.generator_seed == 11
+
+    resource_profile = {"device_kind": "gpu", "memory_gb": 24, "slots": 2}
+    with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
+        acquired = queue.acquire("worker-gpu-0", resource_profile=resource_profile)
+
+    assert ask_batch_mock.call_count == 0
+    assert acquired.status is BatchQueueAcquireStatus.READY
+    assert acquired.generator_mode is BatchGeneratorMode.RANDOM
+    assert acquired.resource_assignment is not None
+    assert acquired.resource_assignment.worker_id == "worker-gpu-0"
+    assert acquired.resource_assignment.resource_profile == resource_profile
+    assert acquired.trial_handle is not None
+
+    system_attrs = study.trials[acquired.trial_handle.number].system_attrs
+    generation_attrs = system_attrs[_BATCH_TRIAL_GENERATION_ATTR]
+    queue_attrs = system_attrs[_BATCH_QUEUE_ENTRY_ATTR]
+    resource_attrs = system_attrs[_BATCH_RESOURCE_ASSIGNMENT_ATTR]
+
+    assert generation_attrs["generator_mode"] == "random"
+    assert generation_attrs["generator_seed"] == 11
+    assert queue_attrs["generator_mode"] == "random"
+    assert "resource_profile" not in queue_attrs
+    assert resource_attrs["worker_id"] == "worker-gpu-0"
+    assert resource_attrs["resource_profile"] == resource_profile
 
 
 def test_batch_candidate_queue_renews_active_lease() -> None:

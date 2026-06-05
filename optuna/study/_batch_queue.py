@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import replace
@@ -10,16 +11,21 @@ from typing import Any
 from typing import TYPE_CHECKING
 
 from optuna.distributions import BaseDistribution
+from optuna.study._batch import _BATCH_RESOURCE_ASSIGNMENT_ATTR
 from optuna.study._batch import _BATCH_TRIAL_LEASE_ATTR
 from optuna.study._batch import BatchAskMetadata
 from optuna.study._batch import BatchFallbackMode
+from optuna.study._batch import BatchGeneratorMode
+from optuna.study._batch import BatchResourceAssignment
 from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellResult
 from optuna.study._batch import BatchTellStatus
 from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import BatchTrialLease
+from optuna.study._batch import create_batch_resource_assignment
 from optuna.study._batch import create_batch_trial_lease
 from optuna.study._batch import get_batch_trial_lease
+from optuna.study._batch import normalize_batch_generator_mode
 from optuna.trial import Trial
 from optuna.trial import TrialState
 
@@ -83,6 +89,8 @@ class BatchQueueAcquireResult:
     ready_count: int
     inflight_count: int
     fallback_mode: BatchFallbackMode | None
+    generator_mode: BatchGeneratorMode | None
+    resource_assignment: BatchResourceAssignment | None
 
 
 @dataclass(frozen=True)
@@ -126,6 +134,7 @@ class _QueueEntry:
     queue_id: str
     batch_id: str
     sampler_snapshot_id: str | None
+    generator_mode: BatchGeneratorMode
     reservation_order: int
     queued_at: datetime.datetime
     fallback_mode: BatchFallbackMode
@@ -137,6 +146,7 @@ class _QueuedCandidate:
     trial_handle: BatchTrialHandle
     batch_id: str
     sampler_snapshot_id: str | None
+    generator_mode: BatchGeneratorMode
     reservation_order: int
     queued_at: datetime.datetime
     fallback_mode: BatchFallbackMode
@@ -147,6 +157,7 @@ class _InflightCandidate:
     trial_handle: BatchTrialHandle
     batch_id: str
     sampler_snapshot_id: str | None
+    generator_mode: BatchGeneratorMode
     reservation_order: int
     queued_at: datetime.datetime
     acquired_at: datetime.datetime
@@ -167,6 +178,8 @@ class BatchCandidateQueue:
         lease_timeout: datetime.timedelta | None = None,
         max_snapshot_age: datetime.timedelta | None = None,
         queue_id: str = "default",
+        generator_mode: BatchGeneratorMode | str | None = None,
+        generator_seed: int | None = None,
     ) -> None:
         if not isinstance(batch_size, int):
             raise TypeError("batch_size must be an integer.")
@@ -196,6 +209,21 @@ class BatchCandidateQueue:
             raise TypeError("queue_id must be a string.")
         if not queue_id:
             raise ValueError("queue_id must be a non-empty string.")
+        normalized_generator_mode = normalize_batch_generator_mode(generator_mode)
+        if generator_seed is not None and (
+            not isinstance(generator_seed, int) or isinstance(generator_seed, bool)
+        ):
+            raise TypeError("generator_seed must be an integer when provided.")
+        if (
+            generator_seed is not None
+            and normalized_generator_mode is BatchGeneratorMode.ADAPTIVE
+        ):
+            raise ValueError("generator_seed requires a non-adaptive generator_mode.")
+        if (
+            normalized_generator_mode is BatchGeneratorMode.RANDOM
+            and not fixed_distributions
+        ):
+            raise ValueError("generator_mode='random' requires fixed_distributions.")
 
         self._study = study
         self._batch_size = batch_size
@@ -205,6 +233,8 @@ class BatchCandidateQueue:
         self._lease_timeout = lease_timeout or datetime.timedelta(minutes=5)
         self._max_snapshot_age = max_snapshot_age
         self._queue_id = queue_id
+        self._generator_mode = normalized_generator_mode
+        self._generator_seed = generator_seed
         self._ready: deque[_QueuedCandidate] = deque()
         self._inflight: dict[int, _InflightCandidate] = {}
 
@@ -235,7 +265,10 @@ class BatchCandidateQueue:
             )
 
         ask_result = self._study.ask_batch(
-            capacity, fixed_distributions=self._fixed_distributions
+            capacity,
+            fixed_distributions=self._fixed_distributions,
+            generator_mode=self._generator_mode,
+            generator_seed=self._generator_seed,
         )
         queued_at = datetime.datetime.now(datetime.timezone.utc)
         for reservation_order, trial_handle in enumerate(ask_result.trial_handles):
@@ -243,6 +276,7 @@ class BatchCandidateQueue:
                 queue_id=self._queue_id,
                 batch_id=ask_result.metadata.batch_id,
                 sampler_snapshot_id=ask_result.metadata.sampler_snapshot_id,
+                generator_mode=ask_result.metadata.generator_mode,
                 reservation_order=reservation_order,
                 queued_at=queued_at,
                 fallback_mode=ask_result.metadata.fallback_mode,
@@ -254,6 +288,7 @@ class BatchCandidateQueue:
                     trial_handle=trial_handle,
                     batch_id=queue_entry.batch_id,
                     sampler_snapshot_id=queue_entry.sampler_snapshot_id,
+                    generator_mode=queue_entry.generator_mode,
                     reservation_order=reservation_order,
                     queued_at=queued_at,
                     fallback_mode=queue_entry.fallback_mode,
@@ -269,13 +304,19 @@ class BatchCandidateQueue:
             ask_metadata=ask_result.metadata,
         )
 
-    def acquire(self, worker_id: str) -> BatchQueueAcquireResult:
+    def acquire(
+        self,
+        worker_id: str,
+        resource_profile: Mapping[str, Any] | None = None,
+    ) -> BatchQueueAcquireResult:
         """Lease one ready queued candidate to a worker without reserving more trials."""
 
         if not isinstance(worker_id, str):
             raise TypeError("worker_id must be a string.")
         if not worker_id:
             raise ValueError("worker_id must be a non-empty string.")
+        if resource_profile is not None and not isinstance(resource_profile, Mapping):
+            raise TypeError("resource_profile must be a mapping when provided.")
 
         if len(self._inflight) >= self._max_inflight:
             return self._empty_acquire_result(BatchQueueAcquireStatus.BACKPRESSURE, worker_id)
@@ -297,16 +338,26 @@ class BatchCandidateQueue:
                 ready_count=len(self._ready),
                 inflight_count=len(self._inflight),
                 fallback_mode=candidate.fallback_mode,
-        )
+                generator_mode=candidate.generator_mode,
+                resource_assignment=None,
+            )
 
+        resource_assignment = (
+            create_batch_resource_assignment(worker_id, now, resource_profile)
+            if resource_profile is not None
+            else None
+        )
         candidate = self._ready.popleft()
         leased_handle = self._attach_lease(candidate.trial_handle, worker_id)
+        if resource_assignment is not None:
+            self._write_resource_assignment(leased_handle, resource_assignment)
         self._write_queue_entry(
             leased_handle,
             _QueueEntry(
                 queue_id=self._queue_id,
                 batch_id=candidate.batch_id,
                 sampler_snapshot_id=candidate.sampler_snapshot_id,
+                generator_mode=candidate.generator_mode,
                 reservation_order=candidate.reservation_order,
                 queued_at=candidate.queued_at,
                 fallback_mode=candidate.fallback_mode,
@@ -317,6 +368,7 @@ class BatchCandidateQueue:
             trial_handle=leased_handle,
             batch_id=candidate.batch_id,
             sampler_snapshot_id=candidate.sampler_snapshot_id,
+            generator_mode=candidate.generator_mode,
             reservation_order=candidate.reservation_order,
             queued_at=candidate.queued_at,
             acquired_at=now,
@@ -333,6 +385,8 @@ class BatchCandidateQueue:
             ready_count=len(self._ready),
             inflight_count=len(self._inflight),
             fallback_mode=candidate.fallback_mode,
+            generator_mode=candidate.generator_mode,
+            resource_assignment=resource_assignment,
         )
 
     def renew(self, trial_handle: BatchTrialHandle) -> BatchQueueRenewResult:
@@ -411,6 +465,7 @@ class BatchCandidateQueue:
                     trial_handle=ready_handle,
                     batch_id=inflight_candidate.batch_id,
                     sampler_snapshot_id=inflight_candidate.sampler_snapshot_id,
+                    generator_mode=inflight_candidate.generator_mode,
                     reservation_order=inflight_candidate.reservation_order,
                     queued_at=inflight_candidate.queued_at,
                     fallback_mode=inflight_candidate.fallback_mode,
@@ -422,6 +477,7 @@ class BatchCandidateQueue:
                     queue_id=self._queue_id,
                     batch_id=inflight_candidate.batch_id,
                     sampler_snapshot_id=inflight_candidate.sampler_snapshot_id,
+                    generator_mode=inflight_candidate.generator_mode,
                     reservation_order=inflight_candidate.reservation_order,
                     queued_at=inflight_candidate.queued_at,
                     fallback_mode=inflight_candidate.fallback_mode,
@@ -491,6 +547,7 @@ class BatchCandidateQueue:
                         trial_handle=trial_handle,
                         batch_id=queue_entry.batch_id,
                         sampler_snapshot_id=queue_entry.sampler_snapshot_id,
+                        generator_mode=queue_entry.generator_mode,
                         reservation_order=queue_entry.reservation_order,
                         queued_at=queue_entry.queued_at,
                         fallback_mode=queue_entry.fallback_mode,
@@ -501,6 +558,7 @@ class BatchCandidateQueue:
                     trial_handle=trial_handle,
                     batch_id=queue_entry.batch_id,
                     sampler_snapshot_id=queue_entry.sampler_snapshot_id,
+                    generator_mode=queue_entry.generator_mode,
                     reservation_order=queue_entry.reservation_order,
                     queued_at=queue_entry.queued_at,
                     acquired_at=queue_entry.acquired_at or queue_entry.queued_at,
@@ -558,6 +616,8 @@ class BatchCandidateQueue:
             ready_count=len(self._ready),
             inflight_count=len(self._inflight),
             fallback_mode=None,
+            generator_mode=None,
+            resource_assignment=None,
         )
 
     def _attach_lease(
@@ -588,6 +648,7 @@ class BatchCandidateQueue:
             "queue_id": queue_entry.queue_id,
             "batch_id": queue_entry.batch_id,
             "sampler_snapshot_id": queue_entry.sampler_snapshot_id,
+            "generator_mode": queue_entry.generator_mode.value,
             "reservation_order": queue_entry.reservation_order,
             "queued_at": queue_entry.queued_at.isoformat(),
             "fallback_mode": queue_entry.fallback_mode.value,
@@ -603,6 +664,21 @@ class BatchCandidateQueue:
         trial_handle.trial._cached_frozen_trial.system_attrs[
             _BATCH_QUEUE_ENTRY_ATTR
         ] = queue_entry_attrs
+
+    def _write_resource_assignment(
+        self,
+        trial_handle: BatchTrialHandle,
+        resource_assignment: BatchResourceAssignment,
+    ) -> None:
+        resource_assignment_attrs = resource_assignment.to_system_attrs()
+        self._study._storage.set_trial_system_attr(
+            trial_handle.trial._trial_id,
+            _BATCH_RESOURCE_ASSIGNMENT_ATTR,
+            resource_assignment_attrs,
+        )
+        trial_handle.trial._cached_frozen_trial.system_attrs[
+            _BATCH_RESOURCE_ASSIGNMENT_ATTR
+        ] = resource_assignment_attrs
 
     def _get_current_lease(
         self, trial_handle: BatchTrialHandle
@@ -635,6 +711,9 @@ def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
     queue_id = raw_queue_entry.get("queue_id")
     batch_id = raw_queue_entry.get("batch_id")
     sampler_snapshot_id = raw_queue_entry.get("sampler_snapshot_id")
+    generator_mode = raw_queue_entry.get(
+        "generator_mode", BatchGeneratorMode.ADAPTIVE.value
+    )
     reservation_order = raw_queue_entry.get("reservation_order")
     queued_at = raw_queue_entry.get("queued_at")
     fallback_mode = raw_queue_entry.get("fallback_mode")
@@ -644,6 +723,8 @@ def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
     if not isinstance(batch_id, str):
         return None
     if sampler_snapshot_id is not None and not isinstance(sampler_snapshot_id, str):
+        return None
+    if not isinstance(generator_mode, str):
         return None
     if not isinstance(reservation_order, int):
         return None
@@ -662,6 +743,7 @@ def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
             else None
         )
         parsed_fallback_mode = BatchFallbackMode(fallback_mode)
+        parsed_generator_mode = BatchGeneratorMode(generator_mode)
     except ValueError:
         return None
 
@@ -669,6 +751,7 @@ def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
         queue_id=queue_id,
         batch_id=batch_id,
         sampler_snapshot_id=sampler_snapshot_id,
+        generator_mode=parsed_generator_mode,
         reservation_order=reservation_order,
         queued_at=parsed_queued_at,
         fallback_mode=parsed_fallback_mode,

@@ -32,11 +32,13 @@ from optuna.distributions import _convert_old_distribution_to_new_distribution
 from optuna.distributions import BaseDistribution
 from optuna.storages._heartbeat import is_heartbeat_enabled
 from optuna.study._batch import _BATCH_TRIAL_COMPLETION_ATTR
+from optuna.study._batch import _BATCH_TRIAL_GENERATION_ATTR
 from optuna.study._batch import _BATCH_TRIAL_LEASE_ATTR
 from optuna.study._batch import BatchAskMetadata
 from optuna.study._batch import BatchAskResult
 from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
+from optuna.study._batch import BatchGeneratorMode
 from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellMetadata
 from optuna.study._batch import BatchTellOutcome
@@ -48,11 +50,13 @@ from optuna.study._batch import calculate_batch_completion_request_signature
 from optuna.study._batch import calculate_batch_suggestion_diagnostics
 from optuna.study._batch import calculate_sampler_snapshot_id
 from optuna.study._batch import create_batch_trial_completion
+from optuna.study._batch import create_batch_trial_generation
 from optuna.study._batch import create_batch_trial_lease
 from optuna.study._batch import fallback_batch_capability
 from optuna.study._batch import get_batch_capability
 from optuna.study._batch import get_batch_trial_completion
 from optuna.study._batch import get_batch_trial_lease
+from optuna.study._batch import normalize_batch_generator_mode
 from optuna.study._batch_queue import BatchCandidateQueue
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study._constrained_optimization import _get_feasible_trials
@@ -643,6 +647,8 @@ class Study:
         fixed_distributions: dict[str, BaseDistribution] | None = None,
         lease_owner: str | None = None,
         lease_timeout: datetime.timedelta | None = None,
+        generator_mode: BatchGeneratorMode | str | None = None,
+        generator_seed: int | None = None,
     ) -> BatchAskResult:
         """Create a batch of new trials from which hyperparameters can be suggested.
 
@@ -664,6 +670,12 @@ class Study:
             lease_timeout:
                 Optional duration used to compute each lease deadline. Defaults to five minutes
                 when ``lease_owner`` is provided.
+            generator_mode:
+                Optional candidate generation mode. ``"adaptive"`` uses the study sampler.
+                ``"random"`` uses a cheap random generator for the fixed search space and records
+                the mode as batch and trial provenance.
+            generator_seed:
+                Optional seed reference for explicit cheap generator modes.
 
         Returns:
             A :class:`~optuna.study._batch.BatchAskResult` with reserved trial handles and
@@ -688,6 +700,16 @@ class Study:
             raise ValueError("lease_timeout must be positive.")
         if lease_owner is not None and lease_timeout is None:
             lease_timeout = datetime.timedelta(minutes=5)
+        normalized_generator_mode = normalize_batch_generator_mode(generator_mode)
+        if generator_seed is not None and (
+            not isinstance(generator_seed, int) or isinstance(generator_seed, bool)
+        ):
+            raise TypeError("generator_seed must be an integer when provided.")
+        if (
+            generator_seed is not None
+            and normalized_generator_mode is BatchGeneratorMode.ADAPTIVE
+        ):
+            raise ValueError("generator_seed requires a non-adaptive generator_mode.")
 
         if not self._thread_local.in_optimize_loop and is_heartbeat_enabled(self._storage):
             optuna_warn("Heartbeat of storage is supposed to be used with Study.optimize.")
@@ -697,11 +719,22 @@ class Study:
             key: _convert_old_distribution_to_new_distribution(dist)
             for key, dist in fixed_distributions.items()
         }
+        if (
+            normalized_generator_mode is BatchGeneratorMode.RANDOM
+            and not fixed_distributions
+        ):
+            raise ValueError("generator_mode='random' requires fixed_distributions.")
 
         # Sync storage once for the batch reservation.
         self._thread_local.cached_all_trials = None
+        batch_id = uuid.uuid4().hex
+        snapshot_source = (
+            samplers.RandomSampler(seed=generator_seed)
+            if normalized_generator_mode is BatchGeneratorMode.RANDOM
+            else self.sampler
+        )
         sampler_snapshot_id = calculate_sampler_snapshot_id(
-            self.sampler,
+            snapshot_source,
             fixed_distributions,
             self._get_trials(
                 deepcopy=False,
@@ -740,8 +773,28 @@ class Study:
 
         trials = [handle.trial for handle in trial_handles]
         native_sampler_batch_used = self._suggest_fixed_distributions_for_batch(
-            trials, fixed_distributions
+            trials,
+            fixed_distributions,
+            normalized_generator_mode,
+            generator_seed,
         )
+        generation_attrs = create_batch_trial_generation(
+            batch_id=batch_id,
+            generator_mode=normalized_generator_mode,
+            generator_seed=generator_seed,
+            sampler_snapshot_id=sampler_snapshot_id,
+        ).to_system_attrs()
+        for trial in trials:
+            trial_generation_attrs = dict(generation_attrs)
+            self._storage.set_trial_system_attr(
+                trial._trial_id,
+                _BATCH_TRIAL_GENERATION_ATTR,
+                trial_generation_attrs,
+            )
+            trial._cached_frozen_trial.system_attrs[
+                _BATCH_TRIAL_GENERATION_ATTR
+            ] = trial_generation_attrs
+
         capability = get_batch_capability(self._storage, native_sampler_batch_used)
         if capability.storage_batch_reservation is BatchCapabilityMode.FALLBACK:
             fallback_mode = BatchFallbackMode.REPEATED_SINGLE_TRIAL
@@ -751,7 +804,7 @@ class Study:
             fallback_mode = BatchFallbackMode.REPEATED_SINGLE_SUGGESTION
 
         metadata = BatchAskMetadata(
-            batch_id=uuid.uuid4().hex,
+            batch_id=batch_id,
             requested_count=count,
             returned_count=len(trial_handles),
             capability=capability,
@@ -760,6 +813,8 @@ class Study:
             suggestion_diagnostics=calculate_batch_suggestion_diagnostics(
                 [trial.params for trial in trials], fixed_distributions
             ),
+            generator_mode=normalized_generator_mode,
+            generator_seed=generator_seed,
         )
         return BatchAskResult(trial_handles=trial_handles, metadata=metadata)
 
@@ -774,6 +829,8 @@ class Study:
         lease_timeout: datetime.timedelta | None = None,
         max_snapshot_age: datetime.timedelta | None = None,
         queue_id: str = "default",
+        generator_mode: BatchGeneratorMode | str | None = None,
+        generator_seed: int | None = None,
     ) -> BatchCandidateQueue:
         """Create an opt-in bounded candidate queue backed by batch reservation.
 
@@ -795,43 +852,68 @@ class Study:
             lease_timeout=lease_timeout,
             max_snapshot_age=max_snapshot_age,
             queue_id=queue_id,
+            generator_mode=generator_mode,
+            generator_seed=generator_seed,
         )
 
     def _suggest_fixed_distributions_for_batch(
-        self, trials: list[Trial], fixed_distributions: dict[str, BaseDistribution]
+        self,
+        trials: list[Trial],
+        fixed_distributions: dict[str, BaseDistribution],
+        generator_mode: BatchGeneratorMode,
+        generator_seed: int | None,
     ) -> bool:
         if not fixed_distributions:
             return False
+
+        if generator_mode is BatchGeneratorMode.RANDOM and all(
+            not trial._cached_frozen_trial.system_attrs.get("fixed_params") for trial in trials
+        ):
+            random_sampler = samplers.RandomSampler(seed=generator_seed)
+            frozen_trials = [trial._cached_frozen_trial for trial in trials]
+            params_batch = random_sampler.sample_batch(
+                self, frozen_trials, fixed_distributions
+            )
+            self._set_fixed_batch_params(trials, fixed_distributions, params_batch)
+            return True
 
         if self.sampler._supports_native_batch_sampling() and all(
             not trial._cached_frozen_trial.system_attrs.get("fixed_params") for trial in trials
         ):
             frozen_trials = [trial._cached_frozen_trial for trial in trials]
             params_batch = self.sampler.sample_batch(self, frozen_trials, fixed_distributions)
-            if len(params_batch) != len(trials):
-                raise ValueError("sample_batch must return one parameter mapping per trial.")
-
-            expected_param_names = set(fixed_distributions)
-            for trial, params in zip(trials, params_batch):
-                if set(params) != expected_param_names:
-                    raise ValueError("sample_batch must return exactly the fixed search space.")
-                for name, distribution in fixed_distributions.items():
-                    param_value = params[name]
-                    param_value_in_internal_repr = distribution.to_internal_repr(param_value)
-                    self._storage.set_trial_param(
-                        trial._trial_id,
-                        name,
-                        param_value_in_internal_repr,
-                        distribution,
-                    )
-                    trial._cached_frozen_trial.distributions[name] = distribution
-                    trial._cached_frozen_trial.params[name] = param_value
+            self._set_fixed_batch_params(trials, fixed_distributions, params_batch)
             return True
 
         for trial in trials:
             for name, param in fixed_distributions.items():
                 trial._suggest(name, param)
         return False
+
+    def _set_fixed_batch_params(
+        self,
+        trials: list[Trial],
+        fixed_distributions: dict[str, BaseDistribution],
+        params_batch: list[dict[str, Any]],
+    ) -> None:
+        if len(params_batch) != len(trials):
+            raise ValueError("sample_batch must return one parameter mapping per trial.")
+
+        expected_param_names = set(fixed_distributions)
+        for trial, params in zip(trials, params_batch):
+            if set(params) != expected_param_names:
+                raise ValueError("sample_batch must return exactly the fixed search space.")
+            for name, distribution in fixed_distributions.items():
+                param_value = params[name]
+                param_value_in_internal_repr = distribution.to_internal_repr(param_value)
+                self._storage.set_trial_param(
+                    trial._trial_id,
+                    name,
+                    param_value_in_internal_repr,
+                    distribution,
+                )
+                trial._cached_frozen_trial.distributions[name] = distribution
+                trial._cached_frozen_trial.params[name] = param_value
 
     def tell(
         self,

@@ -43,6 +43,13 @@ class BatchFallbackMode(Enum):
     REPEATED_SINGLE_COMPLETION = "repeated_single_completion"
 
 
+class BatchGeneratorMode(Enum):
+    """Candidate generation mode used for a high-throughput batch."""
+
+    ADAPTIVE = "adaptive"
+    RANDOM = "random"
+
+
 class BatchTellStatus(Enum):
     """Result status for one batch tell completion request."""
 
@@ -53,6 +60,8 @@ class BatchTellStatus(Enum):
 
 _BATCH_TRIAL_LEASE_ATTR = "batch:trial_lease"
 _BATCH_TRIAL_COMPLETION_ATTR = "batch:trial_completion"
+_BATCH_TRIAL_GENERATION_ATTR = "batch:trial_generation"
+_BATCH_RESOURCE_ASSIGNMENT_ATTR = "batch:resource_assignment"
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,8 @@ class BatchAskMetadata:
     fallback_mode: BatchFallbackMode
     sampler_snapshot_id: str | None = None
     suggestion_diagnostics: BatchSuggestionDiagnostics | None = None
+    generator_mode: BatchGeneratorMode = BatchGeneratorMode.ADAPTIVE
+    generator_seed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +138,40 @@ class BatchTrialCompletion:
         }
 
 
+@dataclass(frozen=True)
+class BatchTrialGeneration:
+    """Durable provenance for how one batch trial was generated."""
+
+    batch_id: str
+    generator_mode: BatchGeneratorMode
+    generator_seed: int | None
+    sampler_snapshot_id: str | None
+
+    def to_system_attrs(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "generator_mode": self.generator_mode.value,
+            "generator_seed": self.generator_seed,
+            "sampler_snapshot_id": self.sampler_snapshot_id,
+        }
+
+
+@dataclass(frozen=True)
+class BatchResourceAssignment:
+    """Resource metadata assigned by a scheduler independently of sampler scoring."""
+
+    worker_id: str
+    assigned_at: datetime
+    resource_profile: dict[str, Any]
+
+    def to_system_attrs(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "assigned_at": self.assigned_at.isoformat(),
+            "resource_profile": self.resource_profile,
+        }
+
+
 def create_batch_trial_lease(
     owner: str, lease_timeout: timedelta, now: datetime | None = None
 ) -> BatchTrialLease:
@@ -135,6 +180,33 @@ def create_batch_trial_lease(
         owner=owner,
         token=uuid.uuid4().hex,
         deadline=now + lease_timeout,
+    )
+
+
+def create_batch_trial_generation(
+    batch_id: str,
+    generator_mode: BatchGeneratorMode,
+    generator_seed: int | None,
+    sampler_snapshot_id: str | None,
+) -> BatchTrialGeneration:
+    return BatchTrialGeneration(
+        batch_id=batch_id,
+        generator_mode=generator_mode,
+        generator_seed=generator_seed,
+        sampler_snapshot_id=sampler_snapshot_id,
+    )
+
+
+def create_batch_resource_assignment(
+    worker_id: str,
+    assigned_at: datetime,
+    resource_profile: Mapping[str, Any],
+) -> BatchResourceAssignment:
+    profile = _normalize_resource_profile(dict(resource_profile))
+    return BatchResourceAssignment(
+        worker_id=worker_id,
+        assigned_at=assigned_at,
+        resource_profile=profile,
     )
 
 
@@ -214,6 +286,24 @@ def fallback_batch_capability() -> BatchCapability:
         storage_batch_reservation=BatchCapabilityMode.FALLBACK,
         sampler_batch_suggestion=BatchCapabilityMode.FALLBACK,
     )
+
+
+def normalize_batch_generator_mode(
+    generator_mode: BatchGeneratorMode | str | None,
+) -> BatchGeneratorMode:
+    if generator_mode is None:
+        return BatchGeneratorMode.ADAPTIVE
+    if isinstance(generator_mode, BatchGeneratorMode):
+        return generator_mode
+    if isinstance(generator_mode, str):
+        try:
+            return BatchGeneratorMode(generator_mode)
+        except ValueError:
+            valid_modes = ", ".join(mode.value for mode in BatchGeneratorMode)
+            raise ValueError(
+                f"generator_mode must be one of: {valid_modes}."
+            ) from None
+    raise TypeError("generator_mode must be a BatchGeneratorMode or string when provided.")
 
 
 def calculate_batch_suggestion_diagnostics(
@@ -492,6 +582,17 @@ def _normalize_json(value: Any) -> Any:
         return _json_fallback(value)
     else:
         return value
+
+
+def _normalize_resource_profile(resource_profile: Mapping[str, Any]) -> dict[str, Any]:
+    for key in resource_profile:
+        if not isinstance(key, str):
+            raise TypeError("resource_profile keys must be strings.")
+
+    serialized_profile = json.dumps(
+        resource_profile, sort_keys=True, separators=(",", ":")
+    )
+    return json.loads(serialized_profile)
 
 
 def _json_fallback(value: Any) -> str:

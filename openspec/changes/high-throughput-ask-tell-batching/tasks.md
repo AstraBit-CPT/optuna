@@ -49,10 +49,10 @@
 
 ## 7. Cheap Generator Modes and Resource Scheduling
 
-- [ ] 7.1 Add high-throughput generator controls for Random, QMC, Sobol-style, or equivalent cheap candidate generation where supported.
-- [ ] 7.2 Record generator mode in batch and trial metadata.
-- [ ] 7.3 Keep heterogeneous worker or GPU resource scheduling separate from sampler scoring.
-- [ ] 7.4 Record worker/device assignment metadata separately from sampler and trial-result metadata.
+- [x] 7.1 Add high-throughput generator controls for Random, QMC, Sobol-style, or equivalent cheap candidate generation where supported.
+- [x] 7.2 Record generator mode in batch and trial metadata.
+- [x] 7.3 Keep heterogeneous worker or GPU resource scheduling separate from sampler scoring.
+- [x] 7.4 Record worker/device assignment metadata separately from sampler and trial-result metadata.
 - [ ] 7.5 Add tests or benchmark fixtures comparing cheap generator modes against adaptive sampler baselines on low-duration objectives.
 
 ## 8. Metrics, Documentation, and Benchmark Gates
