@@ -4,9 +4,12 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from enum import Enum
 from typing import Any
 from typing import TYPE_CHECKING
+import uuid
 
 from optuna.trial import TrialState
 
@@ -79,6 +82,17 @@ class BatchTrialLease:
             "deadline": self.deadline.isoformat(),
             "renewal_count": self.renewal_count,
         }
+
+
+def create_batch_trial_lease(
+    owner: str, lease_timeout: timedelta, now: datetime | None = None
+) -> BatchTrialLease:
+    now = now or datetime.now(timezone.utc)
+    return BatchTrialLease(
+        owner=owner,
+        token=uuid.uuid4().hex,
+        deadline=now + lease_timeout,
+    )
 
 
 @dataclass(frozen=True)

@@ -43,9 +43,11 @@ from optuna.study._batch import BatchTellResult
 from optuna.study._batch import BatchTellStatus
 from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import BatchTrialLease
+from optuna.study._batch import create_batch_trial_lease
 from optuna.study._batch import fallback_batch_capability
 from optuna.study._batch import get_batch_capability
 from optuna.study._batch import get_batch_trial_lease
+from optuna.study._batch_queue import BatchCandidateQueue
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study._constrained_optimization import _get_feasible_trials
 from optuna.study._multi_objective import _get_pareto_front_trials
@@ -710,11 +712,7 @@ class Study:
             lease = None
             if lease_owner is not None:
                 assert lease_timeout is not None
-                lease = BatchTrialLease(
-                    owner=lease_owner,
-                    token=uuid.uuid4().hex,
-                    deadline=datetime.datetime.now(datetime.timezone.utc) + lease_timeout,
-                )
+                lease = create_batch_trial_lease(lease_owner, lease_timeout)
                 lease_attrs = lease.to_system_attrs()
                 self._storage.set_trial_system_attr(
                     trial_id, _BATCH_TRIAL_LEASE_ATTR, lease_attrs
@@ -745,6 +743,36 @@ class Study:
             fallback_mode=fallback_mode,
         )
         return BatchAskResult(trial_handles=trial_handles, metadata=metadata)
+
+    @experimental_func("5.0.0")
+    def create_batch_candidate_queue(
+        self,
+        *,
+        batch_size: int,
+        max_queue_size: int,
+        max_inflight: int,
+        fixed_distributions: dict[str, BaseDistribution] | None = None,
+        lease_timeout: datetime.timedelta | None = None,
+        max_snapshot_age: datetime.timedelta | None = None,
+    ) -> BatchCandidateQueue:
+        """Create an opt-in bounded candidate queue backed by batch reservation.
+
+        The queue separates coordinator-side candidate production from worker-side candidate
+        acquisition. Call :func:`~optuna.study._batch_queue.BatchCandidateQueue.refill` away from
+        the worker hot path to amortize storage reservation and sampler suggestion, then call
+        :func:`~optuna.study._batch_queue.BatchCandidateQueue.acquire` from workers to lease a
+        ready candidate without creating new trials or asking the sampler.
+        """
+
+        return BatchCandidateQueue(
+            study=self,
+            batch_size=batch_size,
+            max_queue_size=max_queue_size,
+            max_inflight=max_inflight,
+            fixed_distributions=fixed_distributions,
+            lease_timeout=lease_timeout,
+            max_snapshot_age=max_snapshot_age,
+        )
 
     def _suggest_fixed_distributions_for_batch(
         self, trials: list[Trial], fixed_distributions: dict[str, BaseDistribution]

@@ -5,6 +5,7 @@ from concurrent.futures import as_completed
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from dataclasses import replace
 import datetime
 import multiprocessing
 import pickle
@@ -42,6 +43,8 @@ from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
 from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellStatus
+from optuna.study._batch_queue import BatchQueueAcquireStatus
+from optuna.study._batch_queue import BatchQueueRefillStatus
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study.study import _SYSTEM_ATTR_METRIC_NAMES
 from optuna.testing.objectives import fail_objective
@@ -1499,6 +1502,127 @@ def test_ask_batch_lease_argument_validation() -> None:
             lease_owner="worker-a",
             lease_timeout=datetime.timedelta(seconds=0),
         )
+
+
+def test_batch_candidate_queue_refill_respects_bounds() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=3, max_queue_size=2, max_inflight=4
+        )
+
+    with pytest.warns(ExperimentalWarning):
+        refill = queue.refill()
+
+    assert refill.status is BatchQueueRefillStatus.RESERVED
+    assert refill.requested_count == 2
+    assert refill.reserved_count == 2
+    assert refill.ready_count == 2
+    assert refill.inflight_count == 0
+    assert queue.ready_count == 2
+    assert queue.inflight_count == 0
+
+    with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
+        refill = queue.refill()
+
+    assert ask_batch_mock.call_count == 0
+    assert refill.status is BatchQueueRefillStatus.BACKPRESSURE
+    assert refill.requested_count == 0
+    assert refill.ready_count == 2
+
+
+def test_batch_candidate_queue_acquire_ready_candidate_without_refill() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=2, max_queue_size=2, max_inflight=2
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue.refill()
+
+    with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
+        acquired = queue.acquire("worker-a")
+
+    assert ask_batch_mock.call_count == 0
+    assert acquired.status is BatchQueueAcquireStatus.READY
+    assert acquired.trial_handle is not None
+    assert acquired.worker_id == "worker-a"
+    assert acquired.reservation_order == 0
+    assert acquired.ready_count == 1
+    assert acquired.inflight_count == 1
+    assert queue.ready_count == 1
+    assert queue.inflight_count == 1
+
+    lease = acquired.trial_handle.lease
+    assert lease is not None
+    assert lease.owner == "worker-a"
+    stored_lease = study.trials[acquired.trial_handle.number].system_attrs[
+        _BATCH_TRIAL_LEASE_ATTR
+    ]
+    assert stored_lease["token"] == lease.token
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = queue.tell(acquired.trial_handle, values=1.0)
+
+    assert tell_result.metadata.completed_count == 1
+    assert tell_result.outcomes[0].status is BatchTellStatus.ACCEPTED
+    assert queue.inflight_count == 0
+
+
+def test_batch_candidate_queue_enforces_max_inflight_backpressure() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=2, max_queue_size=2, max_inflight=1
+        )
+
+    with pytest.warns(ExperimentalWarning):
+        refill = queue.refill()
+    assert refill.requested_count == 1
+    assert refill.reserved_count == 1
+
+    acquired = queue.acquire("worker-a")
+    assert acquired.status is BatchQueueAcquireStatus.READY
+    assert queue.inflight_count == 1
+
+    with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
+        refill = queue.refill()
+        acquired = queue.acquire("worker-b")
+
+    assert ask_batch_mock.call_count == 0
+    assert refill.status is BatchQueueRefillStatus.BACKPRESSURE
+    assert acquired.status is BatchQueueAcquireStatus.BACKPRESSURE
+    assert acquired.trial_handle is None
+
+
+def test_batch_candidate_queue_reports_stale_ready_candidate() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=1,
+            max_queue_size=1,
+            max_inflight=1,
+            max_snapshot_age=datetime.timedelta(seconds=1),
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue.refill()
+
+    stale_candidate = replace(
+        queue._ready[0],
+        queued_at=(
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=2)
+        ),
+    )
+    queue._ready[0] = stale_candidate
+
+    acquired = queue.acquire("worker-a")
+
+    assert acquired.status is BatchQueueAcquireStatus.STALE
+    assert acquired.trial_handle is None
+    assert acquired.ready_count == 1
+    assert acquired.inflight_count == 0
+    assert queue.ready_count == 1
 
 
 # Deprecated distributions are internally converted to corresponding distributions.
