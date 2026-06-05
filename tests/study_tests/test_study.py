@@ -1338,12 +1338,16 @@ def test_ask_fixed_search_space() -> None:
 
 
 def test_ask_batch_fixed_search_space_fallback_metadata() -> None:
+    class FallbackBatchSampler(optuna.samplers.RandomSampler):
+        def _supports_native_batch_sampling(self) -> bool:
+            return False
+
     fixed_distributions = {
         "x": distributions.FloatDistribution(0, 1),
         "y": distributions.CategoricalDistribution(["bacon", "spam"]),
     }
 
-    study = create_study()
+    study = create_study(sampler=FallbackBatchSampler(seed=0))
     with pytest.warns(ExperimentalWarning):
         result = study.ask_batch(3, fixed_distributions=fixed_distributions)
 
@@ -1386,6 +1390,29 @@ def test_ask_batch_uses_native_sampler_batch_for_fixed_search_space() -> None:
         assert 0 <= params["x"] < 1
         assert params["y"] in ["bacon", "spam"]
         assert study.trials[trial.number].params == params
+
+
+def test_ask_batch_uses_native_tpe_sampler_batch_for_fixed_search_space() -> None:
+    fixed_distributions = {
+        "x": distributions.FloatDistribution(0, 1),
+        "y": distributions.CategoricalDistribution(["bacon", "spam"]),
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        sampler = optuna.samplers.TPESampler(
+            constant_liar=True, n_startup_trials=0, seed=0
+        )
+    study = create_study(sampler=sampler)
+
+    with patch.object(sampler, "sample_batch", wraps=sampler.sample_batch) as sample_batch_mock:
+        with pytest.warns(ExperimentalWarning):
+            result = study.ask_batch(3, fixed_distributions=fixed_distributions)
+
+    assert sample_batch_mock.call_count == 1
+    assert result.metadata.fallback_mode is BatchFallbackMode.NONE
+    assert result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.NATIVE
+    assert result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.NATIVE
+    assert all(trial.params.keys() == fixed_distributions.keys() for trial in result.trials)
 
 
 def test_ask_batch_without_fixed_search_space_does_not_use_native_sampler_batch() -> None:

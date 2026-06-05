@@ -11,6 +11,7 @@ from typing import TypeVar
 import numpy as np
 
 from optuna import _deprecated
+from optuna import distributions
 from optuna._convert_positional_args import convert_positional_args
 from optuna._experimental import warn_experimental_argument
 from optuna._hypervolume import compute_hypervolume
@@ -604,6 +605,15 @@ class TPESampler(BaseSampler):
             # For constant_liar, filter out the current trial.
             trials = [t for t in trials if trial.number != t.number]
 
+        return self._sample_from_trials(study, trial, search_space, trials)
+
+    def _sample_from_trials(
+        self,
+        study: Study,
+        trial: FrozenTrial,
+        search_space: dict[str, BaseDistribution],
+        trials: list[FrozenTrial],
+    ) -> dict[str, Any]:
         # We divide data into below and above.
         n = sum(trial.state != TrialState.RUNNING for trial in trials)  # Ignore running trials.
         below_trials, above_trials = _split_trials(
@@ -628,6 +638,80 @@ class TPESampler(BaseSampler):
             ret[param_name] = dist.to_external_repr(ret[param_name])
 
         return ret
+
+    def _supports_native_batch_sampling(self) -> bool:
+        return True
+
+    def sample_batch(
+        self,
+        study: Study,
+        trials: Sequence[FrozenTrial],
+        search_space: dict[str, BaseDistribution],
+    ) -> list[dict[str, Any]]:
+        if search_space == {}:
+            return [{} for _ in trials]
+
+        params_batch: list[dict[str, Any]] = []
+        single_params = {
+            name: distributions._get_single_value(distribution)
+            for name, distribution in search_space.items()
+            if distribution.single()
+        }
+        non_single_search_space = {
+            name: distribution
+            for name, distribution in search_space.items()
+            if not distribution.single()
+        }
+        if non_single_search_space == {}:
+            return [dict(single_params) for _ in trials]
+
+        startup_states = (TrialState.COMPLETE, TrialState.PRUNED)
+        startup_trials = study._get_trials(
+            deepcopy=False, states=startup_states, use_cache=True
+        )
+        if len(startup_trials) < self._n_startup_trials:
+            for random_params in self._random_sampler.sample_batch(
+                study, trials, non_single_search_space
+            ):
+                params = dict(single_params)
+                params.update(random_params)
+                params_batch.append(params)
+            return params_batch
+
+        if self._constant_liar:
+            states = [TrialState.COMPLETE, TrialState.PRUNED, TrialState.RUNNING]
+        else:
+            states = [TrialState.COMPLETE, TrialState.PRUNED]
+        use_cache = not self._constant_liar
+        base_trials = study._get_trials(deepcopy=False, states=states, use_cache=use_cache)
+        pending_batch_trials: list[FrozenTrial] = []
+
+        for trial in trials:
+            if self._constant_liar:
+                pending_numbers = {pending_trial.number for pending_trial in pending_batch_trials}
+                trials_for_sampling = [
+                    frozen_trial
+                    for frozen_trial in base_trials
+                    if frozen_trial.number != trial.number
+                    and frozen_trial.number not in pending_numbers
+                ]
+                trials_for_sampling.extend(pending_batch_trials)
+            else:
+                trials_for_sampling = base_trials
+
+            sampled_params = self._sample_from_trials(
+                study, trial, non_single_search_space, trials_for_sampling
+            )
+            params = dict(single_params)
+            params.update(sampled_params)
+            params_batch.append(params)
+
+            if self._constant_liar:
+                pending_batch_trials.append(
+                    _create_running_trial_with_params(trial, params, search_space)
+                )
+
+        return params_batch
 
     def _build_parzen_estimator(
         self,
@@ -745,6 +829,26 @@ class TPESampler(BaseSampler):
         if self._constraints_func is not None:
             _process_constraints_after_trial(self._constraints_func, study, trial, state)
         self._random_sampler.after_trial(study, trial, state, values)
+
+
+def _create_running_trial_with_params(
+    trial: FrozenTrial,
+    params: dict[str, Any],
+    search_space: dict[str, BaseDistribution],
+) -> FrozenTrial:
+    return FrozenTrial(
+        number=trial.number,
+        state=TrialState.RUNNING,
+        value=None,
+        datetime_start=trial.datetime_start,
+        datetime_complete=None,
+        params=dict(params),
+        distributions={name: search_space[name] for name in params},
+        user_attrs=dict(trial.user_attrs),
+        system_attrs=dict(trial.system_attrs),
+        intermediate_values=dict(trial.intermediate_values),
+        trial_id=trial._trial_id,
+    )
 
 
 def _get_reference_point(loss_vals: np.ndarray) -> np.ndarray:

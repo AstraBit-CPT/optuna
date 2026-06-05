@@ -15,6 +15,7 @@ from optuna.samplers import _tpe
 from optuna.samplers import TPESampler
 from optuna.samplers._base import _CONSTRAINTS_KEY
 from optuna.trial import Trial
+from optuna.trial import TrialState
 
 
 @pytest.mark.parametrize("use_hyperband", [False, True])
@@ -1152,3 +1153,94 @@ def test_constant_liar_with_running_trial(multivariate: bool, multiobjective: bo
     trial.suggest_float("y", 0, 10)
     trial.suggest_categorical("z", [0, 1, 2])
     study.tell(trial, [0, 0] if multiobjective else 0)
+
+
+def test_sample_batch_supports_native_batch_sampling() -> None:
+    sampler = TPESampler()
+
+    assert sampler._supports_native_batch_sampling()
+
+
+def test_sample_batch_uses_in_batch_pending_candidates_with_constant_liar() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
+        sampler = TPESampler(constant_liar=True, n_startup_trials=0, seed=0)
+    study = optuna.create_study(sampler=sampler)
+    search_space = {"x": optuna.distributions.FloatDistribution(0.0, 10.0)}
+    trials = [
+        frozen_trial_factory(
+            idx=0,
+            dist=search_space["x"],
+            state_fn=lambda _: TrialState.RUNNING,
+            value_fn=lambda _: 0.0,
+        ),
+        frozen_trial_factory(
+            idx=1,
+            dist=search_space["x"],
+            state_fn=lambda _: TrialState.RUNNING,
+            value_fn=lambda _: 0.0,
+        ),
+    ]
+    trial_lists: list[list[optuna.trial.FrozenTrial]] = []
+
+    def fake_sample_from_trials(
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        search_space: dict[str, optuna.distributions.BaseDistribution],
+        trials: list[optuna.trial.FrozenTrial],
+    ) -> dict[str, float]:
+        trial_lists.append(trials)
+        return {"x": float(len(trial_lists))}
+
+    with patch.object(
+        sampler, "_sample_from_trials", side_effect=fake_sample_from_trials
+    ) as sample_from_trials_mock:
+        params_batch = sampler.sample_batch(study, trials, search_space)
+
+    assert sample_from_trials_mock.call_count == 2
+    assert params_batch == [{"x": 1.0}, {"x": 2.0}]
+    assert all(trial.number != 0 for trial in trial_lists[0])
+    assert any(
+        trial.number == 0 and trial.state is TrialState.RUNNING and trial.params == {"x": 1.0}
+        for trial in trial_lists[1]
+    )
+    assert all(trial.number != 1 for trial in trial_lists[1])
+
+
+def test_sample_batch_without_constant_liar_does_not_inject_pending_candidates() -> None:
+    sampler = TPESampler(n_startup_trials=0, seed=0)
+    study = optuna.create_study(sampler=sampler)
+    search_space = {"x": optuna.distributions.FloatDistribution(0.0, 10.0)}
+    trials = [
+        frozen_trial_factory(
+            idx=0,
+            dist=search_space["x"],
+            state_fn=lambda _: TrialState.RUNNING,
+            value_fn=lambda _: 0.0,
+        ),
+        frozen_trial_factory(
+            idx=1,
+            dist=search_space["x"],
+            state_fn=lambda _: TrialState.RUNNING,
+            value_fn=lambda _: 0.0,
+        ),
+    ]
+    trial_lists: list[list[optuna.trial.FrozenTrial]] = []
+
+    def fake_sample_from_trials(
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        search_space: dict[str, optuna.distributions.BaseDistribution],
+        trials: list[optuna.trial.FrozenTrial],
+    ) -> dict[str, float]:
+        trial_lists.append(trials)
+        return {"x": float(len(trial_lists))}
+
+    with patch.object(sampler, "_sample_from_trials", side_effect=fake_sample_from_trials):
+        params_batch = sampler.sample_batch(study, trials, search_space)
+
+    assert params_batch == [{"x": 1.0}, {"x": 2.0}]
+    assert all(
+        not (trial.state is TrialState.RUNNING and trial.params == {"x": 1.0})
+        for trial in trial_lists[1]
+    )
