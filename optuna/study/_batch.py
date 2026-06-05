@@ -30,6 +30,14 @@ class BatchFallbackMode(Enum):
     REPEATED_SINGLE_COMPLETION = "repeated_single_completion"
 
 
+class BatchTellStatus(Enum):
+    """Result status for one batch tell completion request."""
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    SKIPPED = "skipped"
+
+
 @dataclass(frozen=True)
 class BatchCapability:
     """Capability labels for storage reservation and sampler suggestion paths."""
@@ -85,6 +93,8 @@ class BatchTellMetadata:
     batch_id: str
     requested_count: int
     completed_count: int
+    rejected_count: int
+    skipped_count: int
     capability: BatchCapability
     fallback_mode: BatchFallbackMode
 
@@ -93,11 +103,13 @@ class BatchTellMetadata:
 class BatchTellOutcome:
     """Per-trial completion result returned by batch tell."""
 
-    trial_number: int
-    state: TrialState
+    trial_number: int | None
+    state: TrialState | None
     values: list[float] | None
-    frozen_trial: FrozenTrial
+    frozen_trial: FrozenTrial | None
     warning_message: str | None
+    status: BatchTellStatus
+    error_message: str | None = None
 
 
 @dataclass(frozen=True)

@@ -39,6 +39,7 @@ from optuna.study import StudyDirection
 from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
 from optuna.study._batch import BatchTellInput
+from optuna.study._batch import BatchTellStatus
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study.study import _SYSTEM_ATTR_METRIC_NAMES
 from optuna.testing.objectives import fail_objective
@@ -1556,6 +1557,8 @@ def test_tell_batch_records_per_trial_outcomes() -> None:
 
     assert tell_result.metadata.requested_count == 3
     assert tell_result.metadata.completed_count == 3
+    assert tell_result.metadata.rejected_count == 0
+    assert tell_result.metadata.skipped_count == 0
     assert (
         tell_result.metadata.fallback_mode is BatchFallbackMode.REPEATED_SINGLE_COMPLETION
     )
@@ -1569,6 +1572,11 @@ def test_tell_batch_records_per_trial_outcomes() -> None:
         TrialState.PRUNED,
         TrialState.FAIL,
     ]
+    assert [outcome.status for outcome in tell_result.outcomes] == [
+        BatchTellStatus.ACCEPTED,
+        BatchTellStatus.ACCEPTED,
+        BatchTellStatus.ACCEPTED,
+    ]
     assert tell_result.outcomes[0].values == [1.0]
     assert tell_result.outcomes[1].values == [2.5]
     assert tell_result.outcomes[2].values is None
@@ -1577,6 +1585,85 @@ def test_tell_batch_records_per_trial_outcomes() -> None:
         TrialState.PRUNED,
         TrialState.FAIL,
     ]
+
+
+def test_tell_batch_rejects_duplicate_completion_per_trial() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(2)
+
+    trial0, trial1 = ask_result.trials
+    completions = [
+        BatchTellInput(trial=trial0, values=1.0),
+        BatchTellInput(trial=trial0, values=2.0),
+        BatchTellInput(trial=trial1, values=3.0),
+    ]
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = study.tell_batch(completions)
+
+    assert tell_result.metadata.requested_count == 3
+    assert tell_result.metadata.completed_count == 2
+    assert tell_result.metadata.rejected_count == 1
+    assert tell_result.metadata.skipped_count == 0
+    assert [outcome.status for outcome in tell_result.outcomes] == [
+        BatchTellStatus.ACCEPTED,
+        BatchTellStatus.REJECTED,
+        BatchTellStatus.ACCEPTED,
+    ]
+    assert tell_result.outcomes[1].trial_number == trial0.number
+    assert tell_result.outcomes[1].state is TrialState.COMPLETE
+    assert tell_result.outcomes[1].values == [1.0]
+    assert tell_result.outcomes[1].error_message == "Cannot tell a COMPLETE trial."
+    assert [trial.value for trial in study.trials] == [1.0, 3.0]
+
+
+def test_tell_batch_rejects_invalid_completion_and_continues() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(2)
+
+    trial0, trial1 = ask_result.trials
+    completions = [
+        BatchTellInput(trial=trial0, state=TrialState.COMPLETE),
+        BatchTellInput(trial=trial1, values=3.0),
+    ]
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = study.tell_batch(completions)
+
+    assert tell_result.metadata.completed_count == 1
+    assert tell_result.metadata.rejected_count == 1
+    assert [outcome.status for outcome in tell_result.outcomes] == [
+        BatchTellStatus.REJECTED,
+        BatchTellStatus.ACCEPTED,
+    ]
+    assert tell_result.outcomes[0].trial_number == trial0.number
+    assert tell_result.outcomes[0].state is TrialState.RUNNING
+    assert (
+        tell_result.outcomes[0].error_message
+        == "No values were told. Values are required when state is TrialState.COMPLETE."
+    )
+    assert [trial.state for trial in study.trials] == [TrialState.RUNNING, TrialState.COMPLETE]
+
+
+def test_tell_batch_skip_if_finished_records_skipped_outcome() -> None:
+    study = create_study()
+    trial = study.ask()
+    study.tell(trial, 1.0)
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = study.tell_batch(
+            [BatchTellInput(trial=trial, values=2.0)], skip_if_finished=True
+        )
+
+    assert tell_result.metadata.completed_count == 0
+    assert tell_result.metadata.rejected_count == 0
+    assert tell_result.metadata.skipped_count == 1
+    assert tell_result.outcomes[0].status is BatchTellStatus.SKIPPED
+    assert tell_result.outcomes[0].trial_number == trial.number
+    assert tell_result.outcomes[0].values == [1.0]
+    assert study.trials[0].value == 1.0
 
 
 def test_batch_api_preserves_single_ask_tell_behavior() -> None:

@@ -38,6 +38,7 @@ from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellMetadata
 from optuna.study._batch import BatchTellOutcome
 from optuna.study._batch import BatchTellResult
+from optuna.study._batch import BatchTellStatus
 from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import fallback_batch_capability
 from optuna.study._batch import get_batch_capability
@@ -840,9 +841,9 @@ class Study:
         """Finish a batch of trials created with :func:`~optuna.study.Study.ask`.
 
         This method is a batch-oriented alternative to :func:`~optuna.study.Study.tell`.
-        The initial experimental implementation preserves correctness by applying each completion
-        through the existing single-trial path and labels that fallback mode in the returned
-        metadata.
+        The initial experimental implementation applies each valid completion independently
+        through the existing single-trial path and records accepted, rejected, and skipped
+        outcomes per trial.
 
         Args:
             completions:
@@ -863,14 +864,46 @@ class Study:
             if not isinstance(completion, BatchTellInput):
                 raise TypeError("Each completion must be a BatchTellInput.")
 
-            state, values, warning_message = _tell_with_warning(
-                study=self,
-                trial=completion.trial,
-                value_or_values=completion.values,
-                state=completion.state,
-                skip_if_finished=skip_if_finished,
-            )
-            frozen_trial = copy.deepcopy(_get_frozen_trial(self, completion.trial))
+            status = BatchTellStatus.ACCEPTED
+            try:
+                frozen_trial_before = _get_frozen_trial(self, completion.trial)
+                if frozen_trial_before.state.is_finished() and skip_if_finished:
+                    status = BatchTellStatus.SKIPPED
+
+                state, values, warning_message = _tell_with_warning(
+                    study=self,
+                    trial=completion.trial,
+                    value_or_values=completion.values,
+                    state=completion.state,
+                    skip_if_finished=skip_if_finished,
+                )
+                frozen_trial = copy.deepcopy(_get_frozen_trial(self, completion.trial))
+            except (TypeError, ValueError) as e:
+                try:
+                    frozen_trial = copy.deepcopy(_get_frozen_trial(self, completion.trial))
+                    trial_number: int | None = frozen_trial.number
+                    state = frozen_trial.state
+                    values = frozen_trial.values
+                except (TypeError, ValueError):
+                    frozen_trial = None
+                    trial_number = (
+                        completion.trial if isinstance(completion.trial, int) else None
+                    )
+                    state = None
+                    values = None
+                outcomes.append(
+                    BatchTellOutcome(
+                        trial_number=trial_number,
+                        state=state,
+                        values=values,
+                        frozen_trial=frozen_trial,
+                        warning_message=None,
+                        status=BatchTellStatus.REJECTED,
+                        error_message=str(e),
+                    )
+                )
+                continue
+
             outcomes.append(
                 BatchTellOutcome(
                     trial_number=frozen_trial.number,
@@ -878,13 +911,25 @@ class Study:
                     values=values,
                     frozen_trial=frozen_trial,
                     warning_message=warning_message,
+                    status=status,
                 )
             )
 
+        completed_count = sum(
+            outcome.status is BatchTellStatus.ACCEPTED for outcome in outcomes
+        )
+        rejected_count = sum(
+            outcome.status is BatchTellStatus.REJECTED for outcome in outcomes
+        )
+        skipped_count = sum(
+            outcome.status is BatchTellStatus.SKIPPED for outcome in outcomes
+        )
         metadata = BatchTellMetadata(
             batch_id=uuid.uuid4().hex,
             requested_count=len(completions),
-            completed_count=len(outcomes),
+            completed_count=completed_count,
+            rejected_count=rejected_count,
+            skipped_count=skipped_count,
             capability=fallback_batch_capability(),
             fallback_mode=BatchFallbackMode.REPEATED_SINGLE_COMPLETION,
         )
