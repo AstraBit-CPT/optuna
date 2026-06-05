@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 from collections.abc import Sequence
 import copy
+import datetime
 from numbers import Real
 import threading
 from typing import Any
@@ -30,6 +31,7 @@ from optuna._warnings import optuna_warn
 from optuna.distributions import _convert_old_distribution_to_new_distribution
 from optuna.distributions import BaseDistribution
 from optuna.storages._heartbeat import is_heartbeat_enabled
+from optuna.study._batch import _BATCH_TRIAL_LEASE_ATTR
 from optuna.study._batch import BatchAskMetadata
 from optuna.study._batch import BatchAskResult
 from optuna.study._batch import BatchCapabilityMode
@@ -40,8 +42,10 @@ from optuna.study._batch import BatchTellOutcome
 from optuna.study._batch import BatchTellResult
 from optuna.study._batch import BatchTellStatus
 from optuna.study._batch import BatchTrialHandle
+from optuna.study._batch import BatchTrialLease
 from optuna.study._batch import fallback_batch_capability
 from optuna.study._batch import get_batch_capability
+from optuna.study._batch import get_batch_trial_lease
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study._constrained_optimization import _get_feasible_trials
 from optuna.study._multi_objective import _get_pareto_front_trials
@@ -629,6 +633,8 @@ class Study:
         self,
         count: int,
         fixed_distributions: dict[str, BaseDistribution] | None = None,
+        lease_owner: str | None = None,
+        lease_timeout: datetime.timedelta | None = None,
     ) -> BatchAskResult:
         """Create a batch of new trials from which hyperparameters can be suggested.
 
@@ -643,6 +649,13 @@ class Study:
             fixed_distributions:
                 A dictionary containing the parameter names and parameter's distributions. Each
                 parameter in this dictionary is automatically suggested for every returned trial.
+            lease_owner:
+                Optional owner label for worker-facing leases attached to the returned trials.
+                When provided, every returned handle includes a lease token that must be supplied
+                to :func:`~optuna.study.Study.tell_batch`.
+            lease_timeout:
+                Optional duration used to compute each lease deadline. Defaults to five minutes
+                when ``lease_owner`` is provided.
 
         Returns:
             A :class:`~optuna.study._batch.BatchAskResult` with reserved trial handles and
@@ -653,6 +666,20 @@ class Study:
             raise TypeError("count must be an integer.")
         if count <= 0:
             raise ValueError("count must be a positive integer.")
+        if lease_owner is not None and not isinstance(lease_owner, str):
+            raise TypeError("lease_owner must be a string when provided.")
+        if lease_owner is not None and not lease_owner:
+            raise ValueError("lease_owner must be a non-empty string when provided.")
+        if lease_timeout is not None and not isinstance(
+            lease_timeout, datetime.timedelta
+        ):
+            raise TypeError("lease_timeout must be a datetime.timedelta when provided.")
+        if lease_owner is None and lease_timeout is not None:
+            raise ValueError("lease_timeout requires lease_owner.")
+        if lease_timeout is not None and lease_timeout <= datetime.timedelta(0):
+            raise ValueError("lease_timeout must be positive.")
+        if lease_owner is not None and lease_timeout is None:
+            lease_timeout = datetime.timedelta(minutes=5)
 
         if not self._thread_local.in_optimize_loop and is_heartbeat_enabled(self._storage):
             optuna_warn("Heartbeat of storage is supposed to be used with Study.optimize.")
@@ -680,7 +707,23 @@ class Study:
         trial_handles: list[BatchTrialHandle] = []
         for trial_id in trial_ids:
             trial = optuna.Trial(self, trial_id)
-            trial_handles.append(BatchTrialHandle(trial=trial, number=trial.number))
+            lease = None
+            if lease_owner is not None:
+                assert lease_timeout is not None
+                lease = BatchTrialLease(
+                    owner=lease_owner,
+                    token=uuid.uuid4().hex,
+                    deadline=datetime.datetime.now(datetime.timezone.utc) + lease_timeout,
+                )
+                lease_attrs = lease.to_system_attrs()
+                self._storage.set_trial_system_attr(
+                    trial_id, _BATCH_TRIAL_LEASE_ATTR, lease_attrs
+                )
+                trial._cached_frozen_trial.system_attrs[_BATCH_TRIAL_LEASE_ATTR] = lease_attrs
+
+            trial_handles.append(
+                BatchTrialHandle(trial=trial, number=trial.number, lease=lease)
+            )
 
         trials = [handle.trial for handle in trial_handles]
         native_sampler_batch_used = self._suggest_fixed_distributions_for_batch(
@@ -865,8 +908,64 @@ class Study:
                 raise TypeError("Each completion must be a BatchTellInput.")
 
             status = BatchTellStatus.ACCEPTED
+            lease: BatchTrialLease | None = None
+            lease_token_valid: bool | None = None
             try:
                 frozen_trial_before = _get_frozen_trial(self, completion.trial)
+                lease = get_batch_trial_lease(frozen_trial_before.system_attrs)
+                if lease is not None and completion.lease_token != lease.token:
+                    outcomes.append(
+                        BatchTellOutcome(
+                            trial_number=frozen_trial_before.number,
+                            state=frozen_trial_before.state,
+                            values=frozen_trial_before.values,
+                            frozen_trial=copy.deepcopy(frozen_trial_before),
+                            warning_message=None,
+                            status=BatchTellStatus.REJECTED,
+                            error_message=(
+                                "Batch lease token does not match the active trial lease."
+                            ),
+                            lease=lease,
+                            lease_token_valid=False,
+                        )
+                    )
+                    continue
+                if (
+                    lease is not None
+                    and lease.deadline <= datetime.datetime.now(datetime.timezone.utc)
+                ):
+                    outcomes.append(
+                        BatchTellOutcome(
+                            trial_number=frozen_trial_before.number,
+                            state=frozen_trial_before.state,
+                            values=frozen_trial_before.values,
+                            frozen_trial=copy.deepcopy(frozen_trial_before),
+                            warning_message=None,
+                            status=BatchTellStatus.REJECTED,
+                            error_message="Batch lease has expired.",
+                            lease=lease,
+                            lease_token_valid=False,
+                        )
+                    )
+                    continue
+                if lease is None and completion.lease_token is not None:
+                    outcomes.append(
+                        BatchTellOutcome(
+                            trial_number=frozen_trial_before.number,
+                            state=frozen_trial_before.state,
+                            values=frozen_trial_before.values,
+                            frozen_trial=copy.deepcopy(frozen_trial_before),
+                            warning_message=None,
+                            status=BatchTellStatus.REJECTED,
+                            error_message="Trial does not have an active batch lease.",
+                            lease=None,
+                            lease_token_valid=False,
+                        )
+                    )
+                    continue
+                if lease is not None:
+                    lease_token_valid = True
+
                 if frozen_trial_before.state.is_finished() and skip_if_finished:
                     status = BatchTellStatus.SKIPPED
 
@@ -900,6 +999,8 @@ class Study:
                         warning_message=None,
                         status=BatchTellStatus.REJECTED,
                         error_message=str(e),
+                        lease=lease,
+                        lease_token_valid=lease_token_valid,
                     )
                 )
                 continue
@@ -912,6 +1013,8 @@ class Study:
                     frozen_trial=frozen_trial,
                     warning_message=warning_message,
                     status=status,
+                    lease=lease,
+                    lease_token_valid=lease_token_valid,
                 )
             )
 

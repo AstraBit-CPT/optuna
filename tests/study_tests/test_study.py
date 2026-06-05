@@ -5,6 +5,7 @@ from concurrent.futures import as_completed
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import datetime
 import multiprocessing
 import pickle
 import threading
@@ -36,6 +37,7 @@ from optuna import TrialPruned
 from optuna.exceptions import DuplicatedStudyError
 from optuna.exceptions import ExperimentalWarning
 from optuna.study import StudyDirection
+from optuna.study._batch import _BATCH_TRIAL_LEASE_ATTR
 from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
 from optuna.study._batch import BatchTellInput
@@ -1451,6 +1453,54 @@ def test_ask_batch_invalid_count() -> None:
         study.ask_batch(1.0)  # type: ignore[arg-type]
 
 
+def test_ask_batch_attaches_trial_leases() -> None:
+    study = create_study()
+    lease_timeout = datetime.timedelta(seconds=30)
+
+    with pytest.warns(ExperimentalWarning):
+        result = study.ask_batch(
+            2, lease_owner="worker-a", lease_timeout=lease_timeout
+        )
+
+    leases = [handle.lease for handle in result.trial_handles]
+    assert all(lease is not None for lease in leases)
+    assert {lease.owner for lease in leases if lease is not None} == {"worker-a"}
+    assert len({lease.token for lease in leases if lease is not None}) == 2
+    assert {lease.renewal_count for lease in leases if lease is not None} == {0}
+
+    for handle in result.trial_handles:
+        assert handle.lease is not None
+        assert handle.lease.deadline.tzinfo is datetime.timezone.utc
+        stored_lease = study.trials[handle.number].system_attrs[_BATCH_TRIAL_LEASE_ATTR]
+        assert stored_lease["owner"] == handle.lease.owner
+        assert stored_lease["token"] == handle.lease.token
+        assert stored_lease["deadline"] == handle.lease.deadline.isoformat()
+        assert stored_lease["renewal_count"] == 0
+
+
+def test_ask_batch_lease_argument_validation() -> None:
+    study = create_study()
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(TypeError):
+        study.ask_batch(1, lease_owner=1)  # type: ignore[arg-type]
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.ask_batch(1, lease_owner="")
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(TypeError):
+        study.ask_batch(1, lease_owner="worker-a", lease_timeout=1)  # type: ignore[arg-type]
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.ask_batch(1, lease_timeout=datetime.timedelta(seconds=1))
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.ask_batch(
+            1,
+            lease_owner="worker-a",
+            lease_timeout=datetime.timedelta(seconds=0),
+        )
+
+
 # Deprecated distributions are internally converted to corresponding distributions.
 @pytest.mark.filterwarnings("ignore::FutureWarning")
 def test_ask_distribution_conversion() -> None:
@@ -1585,6 +1635,124 @@ def test_tell_batch_records_per_trial_outcomes() -> None:
         TrialState.PRUNED,
         TrialState.FAIL,
     ]
+
+
+def test_tell_batch_accepts_valid_lease_tokens() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(2, lease_owner="worker-a")
+
+    completions = []
+    for handle, value in zip(ask_result.trial_handles, [1.0, 2.0]):
+        assert handle.lease is not None
+        completions.append(
+            BatchTellInput(
+                trial=handle.trial,
+                values=value,
+                lease_token=handle.lease.token,
+            )
+        )
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = study.tell_batch(completions)
+
+    assert tell_result.metadata.completed_count == 2
+    assert tell_result.metadata.rejected_count == 0
+    assert [outcome.status for outcome in tell_result.outcomes] == [
+        BatchTellStatus.ACCEPTED,
+        BatchTellStatus.ACCEPTED,
+    ]
+    assert [outcome.lease_token_valid for outcome in tell_result.outcomes] == [
+        True,
+        True,
+    ]
+    lease_owners = [
+        outcome.lease.owner if outcome.lease is not None else None
+        for outcome in tell_result.outcomes
+    ]
+    assert lease_owners == [
+        "worker-a",
+        "worker-a",
+    ]
+
+
+def test_tell_batch_rejects_missing_or_wrong_lease_token_and_continues() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(3, lease_owner="worker-a")
+
+    handle0, handle1, handle2 = ask_result.trial_handles
+    assert handle2.lease is not None
+    completions = [
+        BatchTellInput(trial=handle0.trial, values=1.0),
+        BatchTellInput(trial=handle1.trial, values=2.0, lease_token="wrong-token"),
+        BatchTellInput(
+            trial=handle2.trial,
+            values=3.0,
+            lease_token=handle2.lease.token,
+        ),
+    ]
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = study.tell_batch(completions)
+
+    assert tell_result.metadata.completed_count == 1
+    assert tell_result.metadata.rejected_count == 2
+    assert [outcome.status for outcome in tell_result.outcomes] == [
+        BatchTellStatus.REJECTED,
+        BatchTellStatus.REJECTED,
+        BatchTellStatus.ACCEPTED,
+    ]
+    assert [outcome.lease_token_valid for outcome in tell_result.outcomes] == [
+        False,
+        False,
+        True,
+    ]
+    assert [
+        outcome.error_message for outcome in tell_result.outcomes[:2]
+    ] == [
+        "Batch lease token does not match the active trial lease.",
+        "Batch lease token does not match the active trial lease.",
+    ]
+    assert [trial.state for trial in study.trials] == [
+        TrialState.RUNNING,
+        TrialState.RUNNING,
+        TrialState.COMPLETE,
+    ]
+
+
+def test_tell_batch_rejects_expired_lease_token() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(1, lease_owner="worker-a")
+
+    handle = ask_result.trial_handles[0]
+    assert handle.lease is not None
+    expired_lease_attrs = handle.lease.to_system_attrs()
+    expired_lease_attrs["deadline"] = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    ).isoformat()
+    study._storage.set_trial_system_attr(
+        handle.trial._trial_id, _BATCH_TRIAL_LEASE_ATTR, expired_lease_attrs
+    )
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = study.tell_batch(
+            [
+                BatchTellInput(
+                    trial=handle.trial,
+                    values=1.0,
+                    lease_token=handle.lease.token,
+                )
+            ]
+        )
+
+    assert tell_result.metadata.completed_count == 0
+    assert tell_result.metadata.rejected_count == 1
+    assert tell_result.outcomes[0].status is BatchTellStatus.REJECTED
+    assert tell_result.outcomes[0].lease_token_valid is False
+    assert tell_result.outcomes[0].error_message == "Batch lease has expired."
+    assert study.trials[0].state is TrialState.RUNNING
 
 
 def test_tell_batch_rejects_duplicate_completion_per_trial() -> None:

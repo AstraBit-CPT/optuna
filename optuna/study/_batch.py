@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
+from typing import Any
 from typing import TYPE_CHECKING
 
 from optuna.trial import TrialState
@@ -38,6 +41,9 @@ class BatchTellStatus(Enum):
     SKIPPED = "skipped"
 
 
+_BATCH_TRIAL_LEASE_ATTR = "batch:trial_lease"
+
+
 @dataclass(frozen=True)
 class BatchCapability:
     """Capability labels for storage reservation and sampler suggestion paths."""
@@ -58,11 +64,30 @@ class BatchAskMetadata:
 
 
 @dataclass(frozen=True)
+class BatchTrialLease:
+    """Ownership token for one pre-reserved batch trial."""
+
+    owner: str
+    token: str
+    deadline: datetime
+    renewal_count: int = 0
+
+    def to_system_attrs(self) -> dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "token": self.token,
+            "deadline": self.deadline.isoformat(),
+            "renewal_count": self.renewal_count,
+        }
+
+
+@dataclass(frozen=True)
 class BatchTrialHandle:
     """Reserved trial handle returned by batch ask."""
 
     trial: Trial
     number: int
+    lease: BatchTrialLease | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +109,7 @@ class BatchTellInput:
     trial: Trial | int
     values: float | Sequence[float] | None = None
     state: TrialState | None = None
+    lease_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +136,8 @@ class BatchTellOutcome:
     warning_message: str | None
     status: BatchTellStatus
     error_message: str | None = None
+    lease: BatchTrialLease | None = None
+    lease_token_valid: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +152,35 @@ def fallback_batch_capability() -> BatchCapability:
     return BatchCapability(
         storage_batch_reservation=BatchCapabilityMode.FALLBACK,
         sampler_batch_suggestion=BatchCapabilityMode.FALLBACK,
+    )
+
+
+def get_batch_trial_lease(system_attrs: Mapping[str, Any]) -> BatchTrialLease | None:
+    raw_lease = system_attrs.get(_BATCH_TRIAL_LEASE_ATTR)
+    if not isinstance(raw_lease, Mapping):
+        return None
+
+    owner = raw_lease.get("owner")
+    token = raw_lease.get("token")
+    deadline = raw_lease.get("deadline")
+    renewal_count = raw_lease.get("renewal_count", 0)
+    if not isinstance(owner, str) or not isinstance(token, str):
+        return None
+    if not isinstance(deadline, str):
+        return None
+    if not isinstance(renewal_count, int):
+        return None
+
+    try:
+        parsed_deadline = datetime.fromisoformat(deadline)
+    except ValueError:
+        return None
+
+    return BatchTrialLease(
+        owner=owner,
+        token=token,
+        deadline=parsed_deadline,
+        renewal_count=renewal_count,
     )
 
 
