@@ -9,7 +9,6 @@ from optuna.trial import TrialState
 
 
 if TYPE_CHECKING:
-    from optuna.samplers import BaseSampler
     from optuna.storages import BaseStorage
     from optuna.trial import FrozenTrial
     from optuna.trial import Trial
@@ -116,8 +115,7 @@ def fallback_batch_capability() -> BatchCapability:
     )
 
 
-def get_batch_capability(storage: BaseStorage, sampler: BaseSampler) -> BatchCapability:
-    sample_batch = getattr(sampler, "sample_batch", None)
+def get_batch_capability(storage: BaseStorage, native_sampler_batch_used: bool) -> BatchCapability:
     return BatchCapability(
         storage_batch_reservation=(
             BatchCapabilityMode.NATIVE
@@ -126,7 +124,7 @@ def get_batch_capability(storage: BaseStorage, sampler: BaseSampler) -> BatchCap
         ),
         sampler_batch_suggestion=(
             BatchCapabilityMode.NATIVE
-            if callable(sample_batch)
+            if native_sampler_batch_used
             else BatchCapabilityMode.FALLBACK
         ),
     )

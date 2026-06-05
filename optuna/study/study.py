@@ -632,8 +632,9 @@ class Study:
         """Create a batch of new trials from which hyperparameters can be suggested.
 
         This method is a batch-oriented alternative to :func:`~optuna.study.Study.ask`.
-        The initial experimental implementation preserves correctness by reserving trials through
-        the existing single-trial path and labels that fallback mode in the returned metadata.
+        The initial experimental implementation reserves trial identities through storage batch
+        primitives when available and can precompute fixed-distribution suggestions for samplers
+        with native batch support. Fallback modes are labeled in the returned metadata.
 
         Args:
             count:
@@ -678,16 +679,20 @@ class Study:
         trial_handles: list[BatchTrialHandle] = []
         for trial_id in trial_ids:
             trial = optuna.Trial(self, trial_id)
-            for name, param in fixed_distributions.items():
-                trial._suggest(name, param)
             trial_handles.append(BatchTrialHandle(trial=trial, number=trial.number))
 
-        capability = get_batch_capability(self._storage, self.sampler)
-        fallback_mode = (
-            BatchFallbackMode.REPEATED_SINGLE_TRIAL
-            if capability.storage_batch_reservation is BatchCapabilityMode.FALLBACK
-            else BatchFallbackMode.REPEATED_SINGLE_SUGGESTION
+        trials = [handle.trial for handle in trial_handles]
+        native_sampler_batch_used = self._suggest_fixed_distributions_for_batch(
+            trials, fixed_distributions
         )
+        capability = get_batch_capability(self._storage, native_sampler_batch_used)
+        if capability.storage_batch_reservation is BatchCapabilityMode.FALLBACK:
+            fallback_mode = BatchFallbackMode.REPEATED_SINGLE_TRIAL
+        elif fixed_distributions and native_sampler_batch_used:
+            fallback_mode = BatchFallbackMode.NONE
+        else:
+            fallback_mode = BatchFallbackMode.REPEATED_SINGLE_SUGGESTION
+
         metadata = BatchAskMetadata(
             batch_id=uuid.uuid4().hex,
             requested_count=count,
@@ -696,6 +701,42 @@ class Study:
             fallback_mode=fallback_mode,
         )
         return BatchAskResult(trial_handles=trial_handles, metadata=metadata)
+
+    def _suggest_fixed_distributions_for_batch(
+        self, trials: list[Trial], fixed_distributions: dict[str, BaseDistribution]
+    ) -> bool:
+        if not fixed_distributions:
+            return False
+
+        if self.sampler._supports_native_batch_sampling() and all(
+            not trial._cached_frozen_trial.system_attrs.get("fixed_params") for trial in trials
+        ):
+            frozen_trials = [trial._cached_frozen_trial for trial in trials]
+            params_batch = self.sampler.sample_batch(self, frozen_trials, fixed_distributions)
+            if len(params_batch) != len(trials):
+                raise ValueError("sample_batch must return one parameter mapping per trial.")
+
+            expected_param_names = set(fixed_distributions)
+            for trial, params in zip(trials, params_batch):
+                if set(params) != expected_param_names:
+                    raise ValueError("sample_batch must return exactly the fixed search space.")
+                for name, distribution in fixed_distributions.items():
+                    param_value = params[name]
+                    param_value_in_internal_repr = distribution.to_internal_repr(param_value)
+                    self._storage.set_trial_param(
+                        trial._trial_id,
+                        name,
+                        param_value_in_internal_repr,
+                        distribution,
+                    )
+                    trial._cached_frozen_trial.distributions[name] = distribution
+                    trial._cached_frozen_trial.params[name] = param_value
+            return True
+
+        for trial in trials:
+            for name, param in fixed_distributions.items():
+                trial._suggest(name, param)
+        return False
 
     def tell(
         self,

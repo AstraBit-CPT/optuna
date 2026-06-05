@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from optuna import distributions
 from optuna._warnings import optuna_warn
 from optuna.trial import TrialState
 
@@ -162,6 +163,37 @@ class BaseSampler(abc.ABC):
         """
 
         raise NotImplementedError
+
+    def _supports_native_batch_sampling(self) -> bool:
+        """Return whether this sampler produces batch suggestions in one native operation."""
+
+        return False
+
+    def sample_batch(
+        self,
+        study: Study,
+        trials: Sequence[FrozenTrial],
+        search_space: dict[str, BaseDistribution],
+    ) -> list[dict[str, Any]]:
+        """Sample parameters for multiple trials in a fixed search space.
+
+        The default implementation is a correctness fallback that calls
+        :meth:`sample_independent` for each trial and parameter. Samplers with native batch
+        implementations should override this method and :meth:`_supports_native_batch_sampling`.
+        """
+
+        params_batch = []
+        for trial in trials:
+            params = {}
+            for param_name, param_distribution in search_space.items():
+                if param_distribution.single():
+                    params[param_name] = distributions._get_single_value(param_distribution)
+                else:
+                    params[param_name] = self.sample_independent(
+                        study, trial, param_name, param_distribution
+                    )
+            params_batch.append(params)
+        return params_batch
 
     def before_trial(self, study: Study, trial: FrozenTrial) -> None:
         """Trial pre-processing.

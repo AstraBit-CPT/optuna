@@ -8,6 +8,7 @@ from optuna.samplers._lazy_random_state import LazyRandomState
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from typing import Any
 
     from optuna import distributions
@@ -70,3 +71,24 @@ class RandomSampler(BaseSampler):
         trans_params = self._rng.rng.uniform(trans.bounds[:, 0], trans.bounds[:, 1])
 
         return trans.untransform(trans_params)[param_name]
+
+    def _supports_native_batch_sampling(self) -> bool:
+        return True
+
+    def sample_batch(
+        self,
+        study: Study,
+        trials: Sequence[FrozenTrial],
+        search_space: dict[str, BaseDistribution],
+    ) -> list[dict[str, Any]]:
+        if search_space == {}:
+            return [{} for _ in trials]
+
+        trans = _SearchSpaceTransform(search_space)
+        trans_params_batch = self._rng.rng.uniform(
+            trans.bounds[:, 0],
+            trans.bounds[:, 1],
+            size=(len(trials), trans.bounds.shape[0]),
+        )
+
+        return [trans.untransform(trans_params) for trans_params in trans_params_batch]
