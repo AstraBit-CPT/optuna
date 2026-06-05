@@ -45,6 +45,7 @@ from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellStatus
 from optuna.study._batch_queue import BatchQueueAcquireStatus
 from optuna.study._batch_queue import BatchQueueRefillStatus
+from optuna.study._batch_queue import BatchQueueRenewStatus
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study.study import _SYSTEM_ATTR_METRIC_NAMES
 from optuna.testing.objectives import fail_objective
@@ -1569,6 +1570,77 @@ def test_batch_candidate_queue_acquire_ready_candidate_without_refill() -> None:
     assert queue.inflight_count == 0
 
 
+def test_batch_candidate_queue_renews_active_lease() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=1,
+            max_queue_size=1,
+            max_inflight=1,
+            lease_timeout=datetime.timedelta(seconds=30),
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue.refill()
+
+    acquired = queue.acquire("worker-a")
+    assert acquired.trial_handle is not None
+    original_lease = acquired.trial_handle.lease
+    assert original_lease is not None
+
+    renewed = queue.renew(acquired.trial_handle)
+
+    assert renewed.status is BatchQueueRenewStatus.RENEWED
+    assert renewed.trial_handle is not None
+    assert renewed.lease is not None
+    assert renewed.lease.owner == original_lease.owner
+    assert renewed.lease.token == original_lease.token
+    assert renewed.lease.renewal_count == 1
+    assert renewed.lease.deadline > original_lease.deadline
+    stored_lease = study.trials[renewed.trial_handle.number].system_attrs[
+        _BATCH_TRIAL_LEASE_ATTR
+    ]
+    assert stored_lease["token"] == original_lease.token
+    assert stored_lease["renewal_count"] == 1
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = queue.tell(renewed.trial_handle, values=1.0)
+
+    assert tell_result.metadata.completed_count == 1
+    assert queue.inflight_count == 0
+
+
+def test_batch_candidate_queue_rejects_expired_lease_renewal() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=1, max_queue_size=1, max_inflight=1
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue.refill()
+
+    acquired = queue.acquire("worker-a")
+    assert acquired.trial_handle is not None
+    assert acquired.trial_handle.lease is not None
+    expired_lease_attrs = acquired.trial_handle.lease.to_system_attrs()
+    expired_lease_attrs["deadline"] = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    ).isoformat()
+    study._storage.set_trial_system_attr(
+        acquired.trial_handle.trial._trial_id,
+        _BATCH_TRIAL_LEASE_ATTR,
+        expired_lease_attrs,
+    )
+
+    renewed = queue.renew(acquired.trial_handle)
+
+    assert renewed.status is BatchQueueRenewStatus.EXPIRED
+    assert renewed.trial_handle is not None
+    assert renewed.lease is not None
+    assert renewed.lease.renewal_count == 0
+    assert renewed.error_message == "Batch lease has expired."
+    assert queue.inflight_count == 1
+
+
 def test_batch_candidate_queue_enforces_max_inflight_backpressure() -> None:
     study = create_study()
     with pytest.warns(ExperimentalWarning):
@@ -1593,6 +1665,51 @@ def test_batch_candidate_queue_enforces_max_inflight_backpressure() -> None:
     assert refill.status is BatchQueueRefillStatus.BACKPRESSURE
     assert acquired.status is BatchQueueAcquireStatus.BACKPRESSURE
     assert acquired.trial_handle is None
+
+
+def test_batch_candidate_queue_reclaims_expired_inflight_candidate() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=1, max_queue_size=1, max_inflight=1
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue.refill()
+
+    acquired = queue.acquire("worker-a")
+    assert acquired.trial_handle is not None
+    assert acquired.trial_handle.lease is not None
+    old_lease = acquired.trial_handle.lease
+    expired_lease_attrs = old_lease.to_system_attrs()
+    expired_lease_attrs["deadline"] = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    ).isoformat()
+    study._storage.set_trial_system_attr(
+        acquired.trial_handle.trial._trial_id,
+        _BATCH_TRIAL_LEASE_ATTR,
+        expired_lease_attrs,
+    )
+
+    reclaimed = queue.reclaim_expired()
+
+    assert reclaimed.reclaimed_count == 1
+    assert reclaimed.blocked_count == 0
+    assert reclaimed.reclaimed_trial_numbers == [acquired.trial_handle.number]
+    assert reclaimed.ready_count == 1
+    assert reclaimed.inflight_count == 0
+    assert queue.ready_count == 1
+    assert queue.inflight_count == 0
+
+    with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
+        reacquired = queue.acquire("worker-b")
+
+    assert ask_batch_mock.call_count == 0
+    assert reacquired.status is BatchQueueAcquireStatus.READY
+    assert reacquired.trial_handle is not None
+    assert reacquired.trial_handle.number == acquired.trial_handle.number
+    assert reacquired.trial_handle.lease is not None
+    assert reacquired.trial_handle.lease.owner == "worker-b"
+    assert reacquired.trial_handle.lease.token != old_lease.token
 
 
 def test_batch_candidate_queue_reports_stale_ready_candidate() -> None:
