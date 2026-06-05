@@ -12,6 +12,7 @@ from typing import Any
 from typing import cast
 from typing import TYPE_CHECKING
 from typing import Union
+import uuid
 
 import numpy as np
 
@@ -29,6 +30,15 @@ from optuna._warnings import optuna_warn
 from optuna.distributions import _convert_old_distribution_to_new_distribution
 from optuna.distributions import BaseDistribution
 from optuna.storages._heartbeat import is_heartbeat_enabled
+from optuna.study._batch import BatchAskMetadata
+from optuna.study._batch import BatchAskResult
+from optuna.study._batch import BatchFallbackMode
+from optuna.study._batch import BatchTellInput
+from optuna.study._batch import BatchTellMetadata
+from optuna.study._batch import BatchTellOutcome
+from optuna.study._batch import BatchTellResult
+from optuna.study._batch import BatchTrialHandle
+from optuna.study._batch import fallback_batch_capability
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study._constrained_optimization import _get_feasible_trials
 from optuna.study._multi_objective import _get_pareto_front_trials
@@ -611,6 +621,49 @@ class Study:
 
         return trial
 
+    @experimental_func("5.0.0")
+    def ask_batch(
+        self,
+        count: int,
+        fixed_distributions: dict[str, BaseDistribution] | None = None,
+    ) -> BatchAskResult:
+        """Create a batch of new trials from which hyperparameters can be suggested.
+
+        This method is a batch-oriented alternative to :func:`~optuna.study.Study.ask`.
+        The initial experimental implementation preserves correctness by reserving trials through
+        the existing single-trial path and labels that fallback mode in the returned metadata.
+
+        Args:
+            count:
+                Number of trials to create. Must be a positive integer.
+            fixed_distributions:
+                A dictionary containing the parameter names and parameter's distributions. Each
+                parameter in this dictionary is automatically suggested for every returned trial.
+
+        Returns:
+            A :class:`~optuna.study._batch.BatchAskResult` with reserved trial handles and
+            provenance metadata.
+        """
+
+        if not isinstance(count, int):
+            raise TypeError("count must be an integer.")
+        if count <= 0:
+            raise ValueError("count must be a positive integer.")
+
+        trial_handles: list[BatchTrialHandle] = []
+        for _ in range(count):
+            trial = self.ask(fixed_distributions=fixed_distributions)
+            trial_handles.append(BatchTrialHandle(trial=trial, number=trial.number))
+
+        metadata = BatchAskMetadata(
+            batch_id=uuid.uuid4().hex,
+            requested_count=count,
+            returned_count=len(trial_handles),
+            capability=fallback_batch_capability(),
+            fallback_mode=BatchFallbackMode.REPEATED_SINGLE_TRIAL,
+        )
+        return BatchAskResult(trial_handles=trial_handles, metadata=metadata)
+
     def tell(
         self,
         trial: Trial | int,
@@ -703,6 +756,65 @@ class Study:
             skip_if_finished=skip_if_finished,
         )
         return copy.deepcopy(_get_frozen_trial(self, trial))
+
+    @experimental_func("5.0.0")
+    def tell_batch(
+        self,
+        completions: Sequence[BatchTellInput],
+        skip_if_finished: bool = False,
+    ) -> BatchTellResult:
+        """Finish a batch of trials created with :func:`~optuna.study.Study.ask`.
+
+        This method is a batch-oriented alternative to :func:`~optuna.study.Study.tell`.
+        The initial experimental implementation preserves correctness by applying each completion
+        through the existing single-trial path and labels that fallback mode in the returned
+        metadata.
+
+        Args:
+            completions:
+                Completion requests for trials. Each item must provide a trial object or number,
+                optional objective values, and an optional terminal state.
+            skip_if_finished:
+                Flag to control whether exception should be raised when values for already
+                finished trial are told. If :obj:`True`, tell is skipped without any error
+                when the trial is already finished.
+
+        Returns:
+            A :class:`~optuna.study._batch.BatchTellResult` with per-trial outcomes and
+            provenance metadata.
+        """
+
+        outcomes: list[BatchTellOutcome] = []
+        for completion in completions:
+            if not isinstance(completion, BatchTellInput):
+                raise TypeError("Each completion must be a BatchTellInput.")
+
+            state, values, warning_message = _tell_with_warning(
+                study=self,
+                trial=completion.trial,
+                value_or_values=completion.values,
+                state=completion.state,
+                skip_if_finished=skip_if_finished,
+            )
+            frozen_trial = copy.deepcopy(_get_frozen_trial(self, completion.trial))
+            outcomes.append(
+                BatchTellOutcome(
+                    trial_number=frozen_trial.number,
+                    state=state,
+                    values=values,
+                    frozen_trial=frozen_trial,
+                    warning_message=warning_message,
+                )
+            )
+
+        metadata = BatchTellMetadata(
+            batch_id=uuid.uuid4().hex,
+            requested_count=len(completions),
+            completed_count=len(outcomes),
+            capability=fallback_batch_capability(),
+            fallback_mode=BatchFallbackMode.REPEATED_SINGLE_COMPLETION,
+        )
+        return BatchTellResult(outcomes=outcomes, metadata=metadata)
 
     def set_user_attr(self, key: str, value: Any) -> None:
         """Set a user attribute to the study.

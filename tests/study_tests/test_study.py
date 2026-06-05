@@ -36,6 +36,9 @@ from optuna import TrialPruned
 from optuna.exceptions import DuplicatedStudyError
 from optuna.exceptions import ExperimentalWarning
 from optuna.study import StudyDirection
+from optuna.study._batch import BatchCapabilityMode
+from optuna.study._batch import BatchFallbackMode
+from optuna.study._batch import BatchTellInput
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study.study import _SYSTEM_ATTR_METRIC_NAMES
 from optuna.testing.objectives import fail_objective
@@ -1327,6 +1330,44 @@ def test_ask_fixed_search_space() -> None:
     assert params["y"] in ["bacon", "spam"]
 
 
+def test_ask_batch_fixed_search_space_fallback_metadata() -> None:
+    fixed_distributions = {
+        "x": distributions.FloatDistribution(0, 1),
+        "y": distributions.CategoricalDistribution(["bacon", "spam"]),
+    }
+
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        result = study.ask_batch(3, fixed_distributions=fixed_distributions)
+
+    assert len(result.trials) == 3
+    assert [handle.number for handle in result.trial_handles] == [0, 1, 2]
+    assert len({trial.number for trial in result.trials}) == 3
+    assert result.metadata.requested_count == 3
+    assert result.metadata.returned_count == 3
+    assert result.metadata.fallback_mode is BatchFallbackMode.REPEATED_SINGLE_TRIAL
+    assert (
+        result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.FALLBACK
+    )
+    assert result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.FALLBACK
+
+    for trial in result.trials:
+        params = trial.params
+        assert len(params) == 2
+        assert 0 <= params["x"] < 1
+        assert params["y"] in ["bacon", "spam"]
+
+
+def test_ask_batch_invalid_count() -> None:
+    study = create_study()
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.ask_batch(0)
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(TypeError):
+        study.ask_batch(1.0)  # type: ignore[arg-type]
+
+
 # Deprecated distributions are internally converted to corresponding distributions.
 @pytest.mark.filterwarnings("ignore::FutureWarning")
 def test_ask_distribution_conversion() -> None:
@@ -1413,6 +1454,65 @@ def test_tell() -> None:
     study.tell(study.ask(), state=TrialState.FAIL)
     assert len(study.trials) == 6
     assert len(study.get_trials(states=(TrialState.FAIL,))) == 1
+
+
+def test_tell_batch_records_per_trial_outcomes() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(3)
+
+    trial0, trial1, trial2 = ask_result.trials
+    trial1.report(2.5, step=1)
+    completions = [
+        BatchTellInput(trial=trial0, values=1.0),
+        BatchTellInput(trial=trial1, state=TrialState.PRUNED),
+        BatchTellInput(trial=trial2.number, state=TrialState.FAIL),
+    ]
+
+    with pytest.warns(ExperimentalWarning):
+        tell_result = study.tell_batch(completions)
+
+    assert tell_result.metadata.requested_count == 3
+    assert tell_result.metadata.completed_count == 3
+    assert (
+        tell_result.metadata.fallback_mode is BatchFallbackMode.REPEATED_SINGLE_COMPLETION
+    )
+    assert (
+        tell_result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.FALLBACK
+    )
+    assert tell_result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.FALLBACK
+    assert [outcome.trial_number for outcome in tell_result.outcomes] == [0, 1, 2]
+    assert [outcome.state for outcome in tell_result.outcomes] == [
+        TrialState.COMPLETE,
+        TrialState.PRUNED,
+        TrialState.FAIL,
+    ]
+    assert tell_result.outcomes[0].values == [1.0]
+    assert tell_result.outcomes[1].values == [2.5]
+    assert tell_result.outcomes[2].values is None
+    assert [trial.state for trial in study.trials] == [
+        TrialState.COMPLETE,
+        TrialState.PRUNED,
+        TrialState.FAIL,
+    ]
+
+
+def test_batch_api_preserves_single_ask_tell_behavior() -> None:
+    study = create_study()
+
+    with pytest.warns(ExperimentalWarning):
+        batch_result = study.ask_batch(2)
+    study.tell(batch_result.trials[0], 1.0)
+
+    single_trial = study.ask()
+    assert single_trial.number == 2
+    frozen_trial = study.tell(single_trial, 3.0)
+
+    assert frozen_trial.number == 2
+    assert frozen_trial.state is TrialState.COMPLETE
+    assert frozen_trial.value == 3.0
+    assert len(study.trials) == 3
+    assert study.trials[1].state is TrialState.RUNNING
 
 
 def test_tell_pruned() -> None:
