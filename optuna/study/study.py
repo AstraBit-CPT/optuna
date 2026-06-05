@@ -754,6 +754,7 @@ class Study:
         fixed_distributions: dict[str, BaseDistribution] | None = None,
         lease_timeout: datetime.timedelta | None = None,
         max_snapshot_age: datetime.timedelta | None = None,
+        queue_id: str = "default",
     ) -> BatchCandidateQueue:
         """Create an opt-in bounded candidate queue backed by batch reservation.
 
@@ -761,7 +762,9 @@ class Study:
         acquisition. Call :func:`~optuna.study._batch_queue.BatchCandidateQueue.refill` away from
         the worker hot path to amortize storage reservation and sampler suggestion, then call
         :func:`~optuna.study._batch_queue.BatchCandidateQueue.acquire` from workers to lease a
-        ready candidate without creating new trials or asking the sampler.
+        ready candidate without creating new trials or asking the sampler. Use ``queue_id`` to
+        scope durable queue metadata when a restarted coordinator calls
+        :func:`~optuna.study._batch_queue.BatchCandidateQueue.recover`.
         """
 
         return BatchCandidateQueue(
@@ -772,6 +775,7 @@ class Study:
             fixed_distributions=fixed_distributions,
             lease_timeout=lease_timeout,
             max_snapshot_age=max_snapshot_age,
+            queue_id=queue_id,
         )
 
     def _suggest_fixed_distributions_for_batch(

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from dataclasses import replace
 import datetime
 from enum import Enum
+from typing import Any
 from typing import TYPE_CHECKING
 
 from optuna.distributions import BaseDistribution
@@ -19,11 +20,16 @@ from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import BatchTrialLease
 from optuna.study._batch import create_batch_trial_lease
 from optuna.study._batch import get_batch_trial_lease
+from optuna.trial import Trial
 from optuna.trial import TrialState
 
 
 if TYPE_CHECKING:
     from optuna.study import Study
+    from optuna.trial import FrozenTrial
+
+
+_BATCH_QUEUE_ENTRY_ATTR = "batch:queue_entry"
 
 
 class BatchQueueAcquireStatus(Enum):
@@ -102,6 +108,29 @@ class BatchQueueReclaimResult:
 
 
 @dataclass(frozen=True)
+class BatchQueueRecoveryResult:
+    """Result of reconstructing queue state from durable trial metadata."""
+
+    recovered_ready_count: int
+    recovered_inflight_count: int
+    skipped_count: int
+    ready_count: int
+    inflight_count: int
+    recovered_trial_numbers: list[int]
+    skipped_trial_numbers: list[int]
+
+
+@dataclass(frozen=True)
+class _QueueEntry:
+    queue_id: str
+    batch_id: str
+    reservation_order: int
+    queued_at: datetime.datetime
+    fallback_mode: BatchFallbackMode
+    acquired_at: datetime.datetime | None
+
+
+@dataclass(frozen=True)
 class _QueuedCandidate:
     trial_handle: BatchTrialHandle
     batch_id: str
@@ -133,6 +162,7 @@ class BatchCandidateQueue:
         fixed_distributions: dict[str, BaseDistribution] | None = None,
         lease_timeout: datetime.timedelta | None = None,
         max_snapshot_age: datetime.timedelta | None = None,
+        queue_id: str = "default",
     ) -> None:
         if not isinstance(batch_size, int):
             raise TypeError("batch_size must be an integer.")
@@ -158,6 +188,10 @@ class BatchCandidateQueue:
             raise TypeError("max_snapshot_age must be a datetime.timedelta when provided.")
         if max_snapshot_age is not None and max_snapshot_age <= datetime.timedelta(0):
             raise ValueError("max_snapshot_age must be positive.")
+        if not isinstance(queue_id, str):
+            raise TypeError("queue_id must be a string.")
+        if not queue_id:
+            raise ValueError("queue_id must be a non-empty string.")
 
         self._study = study
         self._batch_size = batch_size
@@ -166,6 +200,7 @@ class BatchCandidateQueue:
         self._fixed_distributions = fixed_distributions
         self._lease_timeout = lease_timeout or datetime.timedelta(minutes=5)
         self._max_snapshot_age = max_snapshot_age
+        self._queue_id = queue_id
         self._ready: deque[_QueuedCandidate] = deque()
         self._inflight: dict[int, _InflightCandidate] = {}
 
@@ -200,13 +235,22 @@ class BatchCandidateQueue:
         )
         queued_at = datetime.datetime.now(datetime.timezone.utc)
         for reservation_order, trial_handle in enumerate(ask_result.trial_handles):
+            queue_entry = _QueueEntry(
+                queue_id=self._queue_id,
+                batch_id=ask_result.metadata.batch_id,
+                reservation_order=reservation_order,
+                queued_at=queued_at,
+                fallback_mode=ask_result.metadata.fallback_mode,
+                acquired_at=None,
+            )
+            self._write_queue_entry(trial_handle, queue_entry)
             self._ready.append(
                 _QueuedCandidate(
                     trial_handle=trial_handle,
-                    batch_id=ask_result.metadata.batch_id,
+                    batch_id=queue_entry.batch_id,
                     reservation_order=reservation_order,
                     queued_at=queued_at,
-                    fallback_mode=ask_result.metadata.fallback_mode,
+                    fallback_mode=queue_entry.fallback_mode,
                 )
             )
 
@@ -250,6 +294,17 @@ class BatchCandidateQueue:
 
         candidate = self._ready.popleft()
         leased_handle = self._attach_lease(candidate.trial_handle, worker_id)
+        self._write_queue_entry(
+            leased_handle,
+            _QueueEntry(
+                queue_id=self._queue_id,
+                batch_id=candidate.batch_id,
+                reservation_order=candidate.reservation_order,
+                queued_at=candidate.queued_at,
+                fallback_mode=candidate.fallback_mode,
+                acquired_at=now,
+            ),
+        )
         self._inflight[leased_handle.number] = _InflightCandidate(
             trial_handle=leased_handle,
             batch_id=candidate.batch_id,
@@ -350,6 +405,17 @@ class BatchCandidateQueue:
                     fallback_mode=inflight_candidate.fallback_mode,
                 )
             )
+            self._write_queue_entry(
+                ready_handle,
+                _QueueEntry(
+                    queue_id=self._queue_id,
+                    batch_id=inflight_candidate.batch_id,
+                    reservation_order=inflight_candidate.reservation_order,
+                    queued_at=inflight_candidate.queued_at,
+                    fallback_mode=inflight_candidate.fallback_mode,
+                    acquired_at=None,
+                ),
+            )
             reclaimed_trial_numbers.append(trial_number)
 
         return BatchQueueReclaimResult(
@@ -358,6 +424,84 @@ class BatchCandidateQueue:
             ready_count=len(self._ready),
             inflight_count=len(self._inflight),
             reclaimed_trial_numbers=reclaimed_trial_numbers,
+        )
+
+    def recover(self) -> BatchQueueRecoveryResult:
+        """Rebuild ready and inflight queue state from durable RUNNING-trial metadata."""
+
+        self._ready.clear()
+        self._inflight.clear()
+
+        recovered_trial_numbers: list[int] = []
+        skipped_trial_numbers: list[int] = []
+        queue_entries: list[tuple[FrozenTrial, _QueueEntry, BatchTrialLease | None]] = []
+        trials = self._study._storage.get_all_trials(
+            self._study._study_id, deepcopy=False, states=(TrialState.RUNNING,)
+        )
+
+        for frozen_trial in trials:
+            queue_entry = _get_batch_queue_entry(frozen_trial.system_attrs)
+            if queue_entry is None or queue_entry.queue_id != self._queue_id:
+                continue
+            queue_entries.append(
+                (
+                    frozen_trial,
+                    queue_entry,
+                    get_batch_trial_lease(frozen_trial.system_attrs),
+                )
+            )
+
+        queue_entries.sort(
+            key=lambda entry: (
+                entry[1].queued_at,
+                entry[1].batch_id,
+                entry[1].reservation_order,
+                entry[0].number,
+            )
+        )
+
+        for frozen_trial, queue_entry, lease in queue_entries:
+            if len(self._ready) + len(self._inflight) >= self._max_inflight:
+                skipped_trial_numbers.append(frozen_trial.number)
+                continue
+
+            trial_handle = BatchTrialHandle(
+                trial=Trial(self._study, frozen_trial._trial_id),
+                number=frozen_trial.number,
+                lease=lease,
+            )
+            if lease is None:
+                if len(self._ready) >= self._max_queue_size:
+                    skipped_trial_numbers.append(frozen_trial.number)
+                    continue
+                self._ready.append(
+                    _QueuedCandidate(
+                        trial_handle=trial_handle,
+                        batch_id=queue_entry.batch_id,
+                        reservation_order=queue_entry.reservation_order,
+                        queued_at=queue_entry.queued_at,
+                        fallback_mode=queue_entry.fallback_mode,
+                    )
+                )
+            else:
+                self._inflight[trial_handle.number] = _InflightCandidate(
+                    trial_handle=trial_handle,
+                    batch_id=queue_entry.batch_id,
+                    reservation_order=queue_entry.reservation_order,
+                    queued_at=queue_entry.queued_at,
+                    acquired_at=queue_entry.acquired_at or queue_entry.queued_at,
+                    fallback_mode=queue_entry.fallback_mode,
+                )
+            recovered_trial_numbers.append(frozen_trial.number)
+
+        return BatchQueueRecoveryResult(
+            recovered_ready_count=len(self._ready),
+            recovered_inflight_count=len(self._inflight),
+            skipped_count=len(skipped_trial_numbers),
+            ready_count=len(self._ready),
+            inflight_count=len(self._inflight),
+            recovered_trial_numbers=recovered_trial_numbers,
+            skipped_trial_numbers=skipped_trial_numbers,
         )
 
     def tell(
@@ -422,6 +566,28 @@ class BatchCandidateQueue:
             _BATCH_TRIAL_LEASE_ATTR
         ] = lease_attrs
 
+    def _write_queue_entry(
+        self, trial_handle: BatchTrialHandle, queue_entry: _QueueEntry
+    ) -> None:
+        queue_entry_attrs = {
+            "queue_id": queue_entry.queue_id,
+            "batch_id": queue_entry.batch_id,
+            "reservation_order": queue_entry.reservation_order,
+            "queued_at": queue_entry.queued_at.isoformat(),
+            "fallback_mode": queue_entry.fallback_mode.value,
+            "acquired_at": (
+                queue_entry.acquired_at.isoformat()
+                if queue_entry.acquired_at is not None
+                else None
+            ),
+        }
+        self._study._storage.set_trial_system_attr(
+            trial_handle.trial._trial_id, _BATCH_QUEUE_ENTRY_ATTR, queue_entry_attrs
+        )
+        trial_handle.trial._cached_frozen_trial.system_attrs[
+            _BATCH_QUEUE_ENTRY_ATTR
+        ] = queue_entry_attrs
+
     def _get_current_lease(
         self, trial_handle: BatchTrialHandle
     ) -> BatchTrialLease | None:
@@ -443,3 +609,48 @@ class BatchCandidateQueue:
             inflight_count=len(self._inflight),
             error_message=error_message,
         )
+
+
+def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
+    raw_queue_entry = system_attrs.get(_BATCH_QUEUE_ENTRY_ATTR)
+    if not isinstance(raw_queue_entry, dict):
+        return None
+
+    queue_id = raw_queue_entry.get("queue_id")
+    batch_id = raw_queue_entry.get("batch_id")
+    reservation_order = raw_queue_entry.get("reservation_order")
+    queued_at = raw_queue_entry.get("queued_at")
+    fallback_mode = raw_queue_entry.get("fallback_mode")
+    acquired_at = raw_queue_entry.get("acquired_at")
+    if not isinstance(queue_id, str):
+        return None
+    if not isinstance(batch_id, str):
+        return None
+    if not isinstance(reservation_order, int):
+        return None
+    if not isinstance(queued_at, str):
+        return None
+    if not isinstance(fallback_mode, str):
+        return None
+    if acquired_at is not None and not isinstance(acquired_at, str):
+        return None
+
+    try:
+        parsed_queued_at = datetime.datetime.fromisoformat(queued_at)
+        parsed_acquired_at = (
+            datetime.datetime.fromisoformat(acquired_at)
+            if acquired_at is not None
+            else None
+        )
+        parsed_fallback_mode = BatchFallbackMode(fallback_mode)
+    except ValueError:
+        return None
+
+    return _QueueEntry(
+        queue_id=queue_id,
+        batch_id=batch_id,
+        reservation_order=reservation_order,
+        queued_at=parsed_queued_at,
+        fallback_mode=parsed_fallback_mode,
+        acquired_at=parsed_acquired_at,
+    )

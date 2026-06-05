@@ -43,6 +43,7 @@ from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
 from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellStatus
+from optuna.study._batch_queue import _BATCH_QUEUE_ENTRY_ATTR
 from optuna.study._batch_queue import BatchQueueAcquireStatus
 from optuna.study._batch_queue import BatchQueueRefillStatus
 from optuna.study._batch_queue import BatchQueueRenewStatus
@@ -1729,6 +1730,140 @@ def test_batch_candidate_queue_reclaims_expired_inflight_candidate() -> None:
 
     with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
         reacquired = queue.acquire("worker-b")
+
+    assert ask_batch_mock.call_count == 0
+    assert reacquired.status is BatchQueueAcquireStatus.READY
+    assert reacquired.trial_handle is not None
+    assert reacquired.trial_handle.number == acquired.trial_handle.number
+    assert reacquired.trial_handle.lease is not None
+    assert reacquired.trial_handle.lease.owner == "worker-b"
+    assert reacquired.trial_handle.lease.token != old_lease.token
+
+
+def test_batch_candidate_queue_recovers_ready_and_inflight_candidates() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=2, max_queue_size=2, max_inflight=2
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue.refill()
+
+    acquired = queue.acquire("worker-a")
+    assert acquired.trial_handle is not None
+    assert acquired.trial_handle.lease is not None
+    ready_trial_number = queue._ready[0].trial_handle.number
+
+    for trial in study.trials:
+        assert _BATCH_QUEUE_ENTRY_ATTR in trial.system_attrs
+
+    with pytest.warns(ExperimentalWarning):
+        recovered_queue = study.create_batch_candidate_queue(
+            batch_size=2, max_queue_size=2, max_inflight=2
+        )
+    recovered = recovered_queue.recover()
+
+    assert recovered.recovered_ready_count == 1
+    assert recovered.recovered_inflight_count == 1
+    assert recovered.skipped_count == 0
+    assert recovered.recovered_trial_numbers == [
+        acquired.trial_handle.number,
+        ready_trial_number,
+    ]
+    assert recovered_queue.ready_count == 1
+    assert recovered_queue.inflight_count == 1
+
+    renewed = recovered_queue.renew(acquired.trial_handle)
+    assert renewed.status is BatchQueueRenewStatus.RENEWED
+
+    with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
+        reacquired = recovered_queue.acquire("worker-b")
+
+    assert ask_batch_mock.call_count == 0
+    assert reacquired.status is BatchQueueAcquireStatus.READY
+    assert reacquired.trial_handle is not None
+    assert reacquired.trial_handle.number == ready_trial_number
+
+
+def test_batch_candidate_queue_recovery_is_scoped_by_queue_id() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue_a = study.create_batch_candidate_queue(
+            batch_size=1,
+            max_queue_size=1,
+            max_inflight=1,
+            queue_id="queue-a",
+        )
+        queue_b = study.create_batch_candidate_queue(
+            batch_size=1,
+            max_queue_size=1,
+            max_inflight=1,
+            queue_id="queue-b",
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue_a.refill()
+        queue_b.refill()
+
+    queue_a_trial_number = queue_a._ready[0].trial_handle.number
+    queue_b_trial_number = queue_b._ready[0].trial_handle.number
+    assert queue_a_trial_number != queue_b_trial_number
+
+    with pytest.warns(ExperimentalWarning):
+        recovered_queue_a = study.create_batch_candidate_queue(
+            batch_size=1,
+            max_queue_size=1,
+            max_inflight=1,
+            queue_id="queue-a",
+        )
+    recovered = recovered_queue_a.recover()
+
+    assert recovered.recovered_ready_count == 1
+    assert recovered.recovered_inflight_count == 0
+    assert recovered.recovered_trial_numbers == [queue_a_trial_number]
+    assert recovered.skipped_count == 0
+    assert recovered_queue_a.ready_count == 1
+    assert queue_b_trial_number not in recovered.recovered_trial_numbers
+
+
+def test_batch_candidate_queue_recovers_and_reclaims_expired_lease() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        queue = study.create_batch_candidate_queue(
+            batch_size=1, max_queue_size=1, max_inflight=1
+        )
+    with pytest.warns(ExperimentalWarning):
+        queue.refill()
+
+    acquired = queue.acquire("worker-a")
+    assert acquired.trial_handle is not None
+    assert acquired.trial_handle.lease is not None
+    old_lease = acquired.trial_handle.lease
+    expired_lease_attrs = old_lease.to_system_attrs()
+    expired_lease_attrs["deadline"] = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    ).isoformat()
+    study._storage.set_trial_system_attr(
+        acquired.trial_handle.trial._trial_id,
+        _BATCH_TRIAL_LEASE_ATTR,
+        expired_lease_attrs,
+    )
+
+    with pytest.warns(ExperimentalWarning):
+        recovered_queue = study.create_batch_candidate_queue(
+            batch_size=1, max_queue_size=1, max_inflight=1
+        )
+    recovered = recovered_queue.recover()
+    reclaimed = recovered_queue.reclaim_expired()
+
+    assert recovered.recovered_ready_count == 0
+    assert recovered.recovered_inflight_count == 1
+    assert reclaimed.reclaimed_count == 1
+    assert reclaimed.reclaimed_trial_numbers == [acquired.trial_handle.number]
+    assert recovered_queue.ready_count == 1
+    assert recovered_queue.inflight_count == 0
+
+    with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
+        reacquired = recovered_queue.acquire("worker-b")
 
     assert ask_batch_mock.call_count == 0
     assert reacquired.status is BatchQueueAcquireStatus.READY
