@@ -53,12 +53,12 @@
 - [x] 7.2 Record generator mode in batch and trial metadata.
 - [x] 7.3 Keep heterogeneous worker or GPU resource scheduling separate from sampler scoring.
 - [x] 7.4 Record worker/device assignment metadata separately from sampler and trial-result metadata.
-- [ ] 7.5 Add tests or benchmark fixtures comparing cheap generator modes against adaptive sampler baselines on low-duration objectives.
+- [x] 7.5 Add tests or benchmark fixtures comparing cheap generator modes against adaptive sampler baselines on low-duration objectives.
 
 ## 8. Metrics, Documentation, and Benchmark Gates
 
-- [ ] 8.1 Add benchmark scenarios comparing synchronous ask/tell, repeated-ask batch fallback, true batch reservation, pending-aware batch suggestion, candidate queue mode, cheap generator mode, and Optuna-as-ledger control behavior where practical.
-- [ ] 8.2 Record p95 candidate wait, storage time, sampler time, throughput, duplicate rate, best-value-per-second, fixed-budget regret, lease reclaim count, and reproducibility metadata.
+- [x] 8.1 Add benchmark scenarios comparing synchronous ask/tell, repeated-ask batch fallback, true batch reservation, pending-aware batch suggestion, candidate queue mode, cheap generator mode, and Optuna-as-ledger control behavior where practical.
+- [x] 8.2 Record p95 candidate wait, storage time, sampler time, throughput, duplicate rate, best-value-per-second, fixed-budget regret, lease reclaim count, and reproducibility metadata.
 - [ ] 8.3 Add documentation explaining throughput-versus-adaptiveness tradeoffs and when cheap generators may beat adaptive BO for millisecond objectives.
 - [ ] 8.4 Add documentation mapping comparable patterns from Ray Tune, Syne Tune, Ax, Vizier, SMAC, OpenBox, Hyperopt SparkTrials, and Nevergrad.
 - [ ] 8.5 Run the focused unit tests and a short benchmark smoke run before promoting the feature beyond experimental status.

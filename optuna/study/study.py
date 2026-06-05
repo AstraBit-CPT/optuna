@@ -9,6 +9,7 @@ import copy
 import datetime
 from numbers import Real
 import threading
+import time
 from typing import Any
 from typing import cast
 from typing import TYPE_CHECKING
@@ -743,6 +744,7 @@ class Study:
             ),
         )
 
+        storage_started_at = time.perf_counter()
         trial_ids = []
         for _ in range(count):
             trial_id = self._pop_waiting_trial_id()
@@ -753,6 +755,7 @@ class Study:
         n_new_trials = count - len(trial_ids)
         if n_new_trials > 0:
             trial_ids.extend(self._storage.create_new_trials(self._study_id, n_new_trials))
+        storage_time = time.perf_counter() - storage_started_at
 
         trial_handles: list[BatchTrialHandle] = []
         for trial_id in trial_ids:
@@ -772,12 +775,14 @@ class Study:
             )
 
         trials = [handle.trial for handle in trial_handles]
+        sampler_started_at = time.perf_counter()
         native_sampler_batch_used = self._suggest_fixed_distributions_for_batch(
             trials,
             fixed_distributions,
             normalized_generator_mode,
             generator_seed,
         )
+        sampler_time = time.perf_counter() - sampler_started_at
         generation_attrs = create_batch_trial_generation(
             batch_id=batch_id,
             generator_mode=normalized_generator_mode,
@@ -815,6 +820,8 @@ class Study:
             ),
             generator_mode=normalized_generator_mode,
             generator_seed=generator_seed,
+            storage_time=storage_time,
+            sampler_time=sampler_time,
         )
         return BatchAskResult(trial_handles=trial_handles, metadata=metadata)
 

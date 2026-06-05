@@ -98,6 +98,8 @@ class BatchAskMetadata:
     suggestion_diagnostics: BatchSuggestionDiagnostics | None = None
     generator_mode: BatchGeneratorMode = BatchGeneratorMode.ADAPTIVE
     generator_seed: int | None = None
+    storage_time: float = 0.0
+    sampler_time: float = 0.0
 
 
 @dataclass(frozen=True)
