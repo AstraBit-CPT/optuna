@@ -31,6 +31,7 @@ from optuna._warnings import optuna_warn
 from optuna.distributions import _convert_old_distribution_to_new_distribution
 from optuna.distributions import BaseDistribution
 from optuna.storages._heartbeat import is_heartbeat_enabled
+from optuna.study._batch import _BATCH_TRIAL_COMPLETION_ATTR
 from optuna.study._batch import _BATCH_TRIAL_LEASE_ATTR
 from optuna.study._batch import BatchAskMetadata
 from optuna.study._batch import BatchAskResult
@@ -43,11 +44,14 @@ from optuna.study._batch import BatchTellResult
 from optuna.study._batch import BatchTellStatus
 from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import BatchTrialLease
+from optuna.study._batch import calculate_batch_completion_request_signature
 from optuna.study._batch import calculate_batch_suggestion_diagnostics
 from optuna.study._batch import calculate_sampler_snapshot_id
+from optuna.study._batch import create_batch_trial_completion
 from optuna.study._batch import create_batch_trial_lease
 from optuna.study._batch import fallback_batch_capability
 from optuna.study._batch import get_batch_capability
+from optuna.study._batch import get_batch_trial_completion
 from optuna.study._batch import get_batch_trial_lease
 from optuna.study._batch_queue import BatchCandidateQueue
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
@@ -953,13 +957,76 @@ class Study:
         for completion in completions:
             if not isinstance(completion, BatchTellInput):
                 raise TypeError("Each completion must be a BatchTellInput.")
+            if completion.completion_key is not None and not isinstance(
+                completion.completion_key, str
+            ):
+                raise TypeError("completion_key must be a string when provided.")
+            if completion.completion_key is not None and not completion.completion_key:
+                raise ValueError("completion_key must be a non-empty string when provided.")
 
             status = BatchTellStatus.ACCEPTED
             lease: BatchTrialLease | None = None
             lease_token_valid: bool | None = None
+            completion_key = completion.completion_key or uuid.uuid4().hex
+            request_signature = calculate_batch_completion_request_signature(
+                completion.values, completion.state
+            )
             try:
                 frozen_trial_before = _get_frozen_trial(self, completion.trial)
                 lease = get_batch_trial_lease(frozen_trial_before.system_attrs)
+                stored_completion = get_batch_trial_completion(
+                    frozen_trial_before.system_attrs
+                )
+                if (
+                    stored_completion is not None
+                    and completion.completion_key == stored_completion.completion_key
+                ):
+                    if stored_completion.request_signature == request_signature:
+                        outcomes.append(
+                            BatchTellOutcome(
+                                trial_number=frozen_trial_before.number,
+                                state=frozen_trial_before.state,
+                                values=frozen_trial_before.values,
+                                frozen_trial=copy.deepcopy(frozen_trial_before),
+                                warning_message=None,
+                                status=BatchTellStatus.SKIPPED,
+                                lease=lease,
+                                lease_token_valid=(
+                                    lease is not None
+                                    and completion.lease_token == lease.token
+                                )
+                                if completion.lease_token is not None
+                                else None,
+                                completion_key=stored_completion.completion_key,
+                                completed_at=stored_completion.completed_at,
+                                idempotent_replay=True,
+                            )
+                        )
+                    else:
+                        outcomes.append(
+                            BatchTellOutcome(
+                                trial_number=frozen_trial_before.number,
+                                state=frozen_trial_before.state,
+                                values=frozen_trial_before.values,
+                                frozen_trial=copy.deepcopy(frozen_trial_before),
+                                warning_message=None,
+                                status=BatchTellStatus.REJECTED,
+                                error_message=(
+                                    "Batch completion key was already used for a "
+                                    "different completion."
+                                ),
+                                lease=lease,
+                                lease_token_valid=(
+                                    lease is not None
+                                    and completion.lease_token == lease.token
+                                )
+                                if completion.lease_token is not None
+                                else None,
+                                completion_key=stored_completion.completion_key,
+                                completed_at=stored_completion.completed_at,
+                            )
+                        )
+                    continue
                 if lease is not None and completion.lease_token != lease.token:
                     outcomes.append(
                         BatchTellOutcome(
@@ -974,6 +1041,7 @@ class Study:
                             ),
                             lease=lease,
                             lease_token_valid=False,
+                            completion_key=completion.completion_key,
                         )
                     )
                     continue
@@ -992,6 +1060,7 @@ class Study:
                             error_message="Batch lease has expired.",
                             lease=lease,
                             lease_token_valid=False,
+                            completion_key=completion.completion_key,
                         )
                     )
                     continue
@@ -1007,6 +1076,7 @@ class Study:
                             error_message="Trial does not have an active batch lease.",
                             lease=None,
                             lease_token_valid=False,
+                            completion_key=completion.completion_key,
                         )
                     )
                     continue
@@ -1016,14 +1086,38 @@ class Study:
                 if frozen_trial_before.state.is_finished() and skip_if_finished:
                     status = BatchTellStatus.SKIPPED
 
+                completed_at = datetime.datetime.now(datetime.timezone.utc)
+
+                def before_state_values_update(
+                    frozen_trial: FrozenTrial,
+                    accepted_state: TrialState,
+                    accepted_values: list[float] | None,
+                ) -> None:
+                    batch_completion = create_batch_trial_completion(
+                        completion_key,
+                        completed_at,
+                        accepted_state,
+                        accepted_values,
+                        request_signature,
+                    )
+                    self._storage.set_trial_system_attr(
+                        frozen_trial._trial_id,
+                        _BATCH_TRIAL_COMPLETION_ATTR,
+                        batch_completion.to_system_attrs(),
+                    )
+
                 state, values, warning_message = _tell_with_warning(
                     study=self,
                     trial=completion.trial,
                     value_or_values=completion.values,
                     state=completion.state,
                     skip_if_finished=skip_if_finished,
+                    before_state_values_update=before_state_values_update,
                 )
                 frozen_trial = copy.deepcopy(_get_frozen_trial(self, completion.trial))
+                stored_completion = get_batch_trial_completion(frozen_trial.system_attrs)
+                if stored_completion is not None:
+                    completed_at = stored_completion.completed_at
             except (TypeError, ValueError) as e:
                 try:
                     frozen_trial = copy.deepcopy(_get_frozen_trial(self, completion.trial))
@@ -1048,6 +1142,7 @@ class Study:
                         error_message=str(e),
                         lease=lease,
                         lease_token_valid=lease_token_valid,
+                        completion_key=completion.completion_key,
                     )
                 )
                 continue
@@ -1062,6 +1157,8 @@ class Study:
                     status=status,
                     lease=lease,
                     lease_token_valid=lease_token_valid,
+                    completion_key=completion_key if status is BatchTellStatus.ACCEPTED else None,
+                    completed_at=completed_at if status is BatchTellStatus.ACCEPTED else None,
                 )
             )
 

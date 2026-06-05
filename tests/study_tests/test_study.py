@@ -38,6 +38,7 @@ from optuna import TrialPruned
 from optuna.exceptions import DuplicatedStudyError
 from optuna.exceptions import ExperimentalWarning
 from optuna.study import StudyDirection
+from optuna.study._batch import _BATCH_TRIAL_COMPLETION_ATTR
 from optuna.study._batch import _BATCH_TRIAL_LEASE_ATTR
 from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
@@ -2099,6 +2100,19 @@ def test_tell_batch_records_per_trial_outcomes() -> None:
     assert tell_result.outcomes[0].values == [1.0]
     assert tell_result.outcomes[1].values == [2.5]
     assert tell_result.outcomes[2].values is None
+    assert all(
+        outcome.completion_key is not None for outcome in tell_result.outcomes
+    )
+    assert all(
+        outcome.completed_at is not None for outcome in tell_result.outcomes
+    )
+    completion_attrs = [
+        trial.system_attrs[_BATCH_TRIAL_COMPLETION_ATTR] for trial in study.trials
+    ]
+    assert [attr["state"] for attr in completion_attrs] == ["COMPLETE", "PRUNED", "FAIL"]
+    assert [attr["values"] for attr in completion_attrs] == [[1.0], [2.5], None]
+    assert all(isinstance(attr["completion_key"], str) for attr in completion_attrs)
+    assert all(isinstance(attr["completed_at"], str) for attr in completion_attrs)
     assert [trial.state for trial in study.trials] == [
         TrialState.COMPLETE,
         TrialState.PRUNED,
@@ -2253,6 +2267,86 @@ def test_tell_batch_rejects_duplicate_completion_per_trial() -> None:
     assert tell_result.outcomes[1].values == [1.0]
     assert tell_result.outcomes[1].error_message == "Cannot tell a COMPLETE trial."
     assert [trial.value for trial in study.trials] == [1.0, 3.0]
+
+
+def test_tell_batch_replays_matching_completion_key_idempotently() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(1)
+
+    completion = BatchTellInput(
+        trial=ask_result.trials[0], values=1.0, completion_key="completion-0"
+    )
+    with pytest.warns(ExperimentalWarning):
+        accepted = study.tell_batch([completion])
+        replayed = study.tell_batch([completion])
+
+    assert accepted.metadata.completed_count == 1
+    assert accepted.metadata.skipped_count == 0
+    assert accepted.outcomes[0].status is BatchTellStatus.ACCEPTED
+    assert accepted.outcomes[0].completion_key == "completion-0"
+    assert accepted.outcomes[0].completed_at is not None
+
+    assert replayed.metadata.completed_count == 0
+    assert replayed.metadata.skipped_count == 1
+    assert replayed.metadata.rejected_count == 0
+    assert replayed.outcomes[0].status is BatchTellStatus.SKIPPED
+    assert replayed.outcomes[0].idempotent_replay is True
+    assert replayed.outcomes[0].completion_key == "completion-0"
+    assert replayed.outcomes[0].completed_at == accepted.outcomes[0].completed_at
+    assert replayed.outcomes[0].values == [1.0]
+    assert study.trials[0].value == 1.0
+
+
+def test_tell_batch_rejects_reused_completion_key_with_different_payload() -> None:
+    study = create_study()
+    with pytest.warns(ExperimentalWarning):
+        ask_result = study.ask_batch(1)
+
+    with pytest.warns(ExperimentalWarning):
+        accepted = study.tell_batch(
+            [
+                BatchTellInput(
+                    trial=ask_result.trials[0],
+                    values=1.0,
+                    completion_key="completion-0",
+                )
+            ]
+        )
+        rejected = study.tell_batch(
+            [
+                BatchTellInput(
+                    trial=ask_result.trials[0],
+                    values=2.0,
+                    completion_key="completion-0",
+                )
+            ]
+        )
+
+    assert accepted.metadata.completed_count == 1
+    assert rejected.metadata.completed_count == 0
+    assert rejected.metadata.rejected_count == 1
+    assert rejected.outcomes[0].status is BatchTellStatus.REJECTED
+    assert rejected.outcomes[0].completion_key == "completion-0"
+    assert rejected.outcomes[0].completed_at == accepted.outcomes[0].completed_at
+    assert (
+        rejected.outcomes[0].error_message
+        == "Batch completion key was already used for a different completion."
+    )
+    assert study.trials[0].value == 1.0
+
+
+def test_tell_batch_completion_key_argument_validation() -> None:
+    study = create_study()
+    trial = study.ask()
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(TypeError):
+        study.tell_batch(
+            [BatchTellInput(trial=trial, values=1.0, completion_key=1)]  # type: ignore[arg-type]
+        )
+
+    with pytest.warns(ExperimentalWarning), pytest.raises(ValueError):
+        study.tell_batch([BatchTellInput(trial=trial, values=1.0, completion_key="")])
 
 
 def test_tell_batch_rejects_invalid_completion_and_continues() -> None:

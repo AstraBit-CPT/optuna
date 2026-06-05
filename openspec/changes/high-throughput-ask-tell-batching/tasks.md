@@ -25,9 +25,9 @@
 
 ## 4. Batch Completion and Idempotency
 
-- [ ] 4.1 Add batch completion plumbing that records per-trial values, states, errors, and completion timestamps.
+- [x] 4.1 Add batch completion plumbing that records per-trial values, states, errors, and completion timestamps.
 - [x] 4.2 Preserve existing single-trial `tell` behavior and compatibility paths.
-- [ ] 4.3 Add idempotency keys or completion tokens for reserved trials.
+- [x] 4.3 Add idempotency keys or completion tokens for reserved trials.
 - [x] 4.4 Reject or ignore duplicate completion attempts after one completion has been accepted.
 - [x] 4.5 Add tests for mixed successful, failed, and pruned outcomes in one batch completion request.
 

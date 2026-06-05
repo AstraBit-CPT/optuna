@@ -52,6 +52,7 @@ class BatchTellStatus(Enum):
 
 
 _BATCH_TRIAL_LEASE_ATTR = "batch:trial_lease"
+_BATCH_TRIAL_COMPLETION_ATTR = "batch:trial_completion"
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,26 @@ class BatchTrialLease:
         }
 
 
+@dataclass(frozen=True)
+class BatchTrialCompletion:
+    """Durable idempotency metadata for one accepted batch completion."""
+
+    completion_key: str
+    completed_at: datetime
+    state: TrialState
+    values: list[float] | None
+    request_signature: str
+
+    def to_system_attrs(self) -> dict[str, Any]:
+        return {
+            "completion_key": self.completion_key,
+            "completed_at": self.completed_at.isoformat(),
+            "state": self.state.name,
+            "values": self.values,
+            "request_signature": self.request_signature,
+        }
+
+
 def create_batch_trial_lease(
     owner: str, lease_timeout: timedelta, now: datetime | None = None
 ) -> BatchTrialLease:
@@ -146,6 +167,7 @@ class BatchTellInput:
     values: float | Sequence[float] | None = None
     state: TrialState | None = None
     lease_token: str | None = None
+    completion_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +196,9 @@ class BatchTellOutcome:
     error_message: str | None = None
     lease: BatchTrialLease | None = None
     lease_token_valid: bool | None = None
+    completion_key: str | None = None
+    completed_at: datetime | None = None
+    idempotent_replay: bool = False
 
 
 @dataclass(frozen=True)
@@ -299,6 +324,74 @@ def get_batch_trial_lease(system_attrs: Mapping[str, Any]) -> BatchTrialLease | 
     )
 
 
+def create_batch_trial_completion(
+    completion_key: str,
+    completed_at: datetime,
+    state: TrialState,
+    values: list[float] | None,
+    request_signature: str,
+) -> BatchTrialCompletion:
+    return BatchTrialCompletion(
+        completion_key=completion_key,
+        completed_at=completed_at,
+        state=state,
+        values=list(values) if values is not None else None,
+        request_signature=request_signature,
+    )
+
+
+def get_batch_trial_completion(
+    system_attrs: Mapping[str, Any]
+) -> BatchTrialCompletion | None:
+    raw_completion = system_attrs.get(_BATCH_TRIAL_COMPLETION_ATTR)
+    if not isinstance(raw_completion, Mapping):
+        return None
+
+    completion_key = raw_completion.get("completion_key")
+    completed_at = raw_completion.get("completed_at")
+    state = raw_completion.get("state")
+    values = raw_completion.get("values")
+    request_signature = raw_completion.get("request_signature")
+    if not isinstance(completion_key, str):
+        return None
+    if not isinstance(completed_at, str):
+        return None
+    if not isinstance(state, str):
+        return None
+    if values is not None and not isinstance(values, list):
+        return None
+    if not isinstance(request_signature, str):
+        return None
+
+    try:
+        parsed_completed_at = datetime.fromisoformat(completed_at)
+        parsed_state = TrialState[state]
+    except (KeyError, ValueError):
+        return None
+
+    return BatchTrialCompletion(
+        completion_key=completion_key,
+        completed_at=parsed_completed_at,
+        state=parsed_state,
+        values=values,
+        request_signature=request_signature,
+    )
+
+
+def calculate_batch_completion_request_signature(
+    values: float | Sequence[float] | None,
+    state: TrialState | None,
+) -> str:
+    payload = {
+        "state": state.name if state is not None else None,
+        "values": _normalize_completion_values(values),
+    }
+    serialized_payload = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=_json_fallback
+    )
+    return hashlib.sha256(serialized_payload.encode()).hexdigest()
+
+
 def get_batch_capability(storage: BaseStorage, native_sampler_batch_used: bool) -> BatchCapability:
     return BatchCapability(
         storage_batch_reservation=(
@@ -403,3 +496,23 @@ def _normalize_json(value: Any) -> Any:
 
 def _json_fallback(value: Any) -> str:
     return repr(value)
+
+
+def _normalize_completion_values(values: float | Sequence[float] | None) -> Any:
+    if values is None:
+        return None
+    if isinstance(values, Sequence) and not isinstance(values, (bytes, str)):
+        return [_normalize_completion_value(value) for value in values]
+    return [_normalize_completion_value(values)]
+
+
+def _normalize_completion_value(value: Any) -> Any:
+    try:
+        float_value = float(value)
+    except (TypeError, ValueError):
+        return _json_fallback(value)
+    if math.isnan(float_value):
+        return "nan"
+    if math.isinf(float_value):
+        return "inf" if float_value > 0 else "-inf"
+    return float_value

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Sequence
 import math
 from typing import TYPE_CHECKING
@@ -84,6 +85,10 @@ def _tell_with_warning(
     state: TrialState | None = None,
     skip_if_finished: bool = False,
     suppress_warning: bool = False,
+    before_state_values_update: Callable[
+        [FrozenTrial, TrialState, list[float] | None], None
+    ]
+    | None = None,
 ) -> tuple[TrialState, list[float] | None, str | None]:
     """Internal method of :func:`~optuna.study.Study.tell`.
 
@@ -170,6 +175,8 @@ def _tell_with_warning(
         study = pruners._filter_study(study, frozen_trial)
         study.sampler.after_trial(study, frozen_trial, state, values)
     finally:
+        if before_state_values_update is not None:
+            before_state_values_update(frozen_trial, state, values)
         study._storage.set_trial_state_values(frozen_trial._trial_id, state, values)
 
     return state, values, values_conversion_failure_message
