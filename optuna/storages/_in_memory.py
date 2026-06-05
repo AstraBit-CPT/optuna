@@ -171,6 +171,37 @@ class InMemoryStorage(BaseStorage):
             self._update_cache(trial_id, study_id)
             return trial_id
 
+    def _supports_native_batch_trial_creation(self) -> bool:
+        return True
+
+    def create_new_trials(
+        self,
+        study_id: int,
+        count: int,
+        template_trials: Sequence[FrozenTrial | None] | None = None,
+    ) -> list[int]:
+        template_trials = self._validate_create_new_trials_args(count, template_trials)
+        with self._lock:
+            self._check_study_id(study_id)
+
+            trial_ids = []
+            for template_trial in template_trials:
+                if template_trial is None:
+                    trial = self._create_running_trial()
+                else:
+                    trial = copy.deepcopy(template_trial)
+
+                trial_id = self._max_trial_id + 1
+                self._max_trial_id += 1
+                trial.number = len(self._studies[study_id].trials)
+                trial._trial_id = trial_id
+                self._trial_id_to_study_id_and_number[trial_id] = (study_id, trial.number)
+                self._studies[study_id].trials.append(trial)
+                self._update_cache(trial_id, study_id)
+                trial_ids.append(trial_id)
+
+            return trial_ids
+
     @staticmethod
     def _create_running_trial() -> FrozenTrial:
         return FrozenTrial(

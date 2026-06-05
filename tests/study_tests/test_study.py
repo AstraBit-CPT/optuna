@@ -1345,10 +1345,8 @@ def test_ask_batch_fixed_search_space_fallback_metadata() -> None:
     assert len({trial.number for trial in result.trials}) == 3
     assert result.metadata.requested_count == 3
     assert result.metadata.returned_count == 3
-    assert result.metadata.fallback_mode is BatchFallbackMode.REPEATED_SINGLE_TRIAL
-    assert (
-        result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.FALLBACK
-    )
+    assert result.metadata.fallback_mode is BatchFallbackMode.REPEATED_SINGLE_SUGGESTION
+    assert result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.NATIVE
     assert result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.FALLBACK
 
     for trial in result.trials:
@@ -1356,6 +1354,51 @@ def test_ask_batch_fixed_search_space_fallback_metadata() -> None:
         assert len(params) == 2
         assert 0 <= params["x"] < 1
         assert params["y"] in ["bacon", "spam"]
+
+
+def test_ask_batch_uses_storage_batch_reservation_for_new_trials() -> None:
+    study = create_study()
+
+    with patch.object(
+        study._storage, "create_new_trials", wraps=study._storage.create_new_trials
+    ) as create_new_trials_mock:
+        with pytest.warns(ExperimentalWarning):
+            result = study.ask_batch(3)
+
+    assert create_new_trials_mock.call_count == 1
+    assert create_new_trials_mock.call_args.args == (study._study_id, 3)
+    assert [trial.number for trial in result.trials] == [0, 1, 2]
+    assert result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.NATIVE
+
+
+def test_ask_batch_preserves_enqueued_trial_order() -> None:
+    study = create_study()
+    study.enqueue_trial({"x": 0.5}, user_attrs={"memo": "this is memo"})
+
+    with patch.object(
+        study._storage, "create_new_trials", wraps=study._storage.create_new_trials
+    ) as create_new_trials_mock:
+        with pytest.warns(ExperimentalWarning):
+            result = study.ask_batch(2)
+
+    assert create_new_trials_mock.call_count == 1
+    assert create_new_trials_mock.call_args.args == (study._study_id, 1)
+    assert [trial.number for trial in result.trials] == [0, 1]
+    assert result.trials[0].suggest_float("x", 0, 1) == 0.5
+    assert result.trials[0].user_attrs == {"memo": "this is memo"}
+    assert study.trials[1].state == TrialState.RUNNING
+
+
+def test_ask_batch_uses_native_storage_batch_reservation_with_cached_rdb() -> None:
+    with StorageSupplier("sqlite") as storage:
+        study = create_study(storage=storage)
+
+        with pytest.warns(ExperimentalWarning):
+            result = study.ask_batch(3)
+
+        assert [trial.number for trial in result.trials] == [0, 1, 2]
+        assert result.metadata.capability.storage_batch_reservation is BatchCapabilityMode.NATIVE
+        assert result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.FALLBACK
 
 
 def test_ask_batch_invalid_count() -> None:

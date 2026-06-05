@@ -461,6 +461,45 @@ class RDBStorage(BaseStorage, BaseHeartbeat):
     def create_new_trial(self, study_id: int, template_trial: FrozenTrial | None = None) -> int:
         return self._create_new_trial(study_id, template_trial)._trial_id
 
+    def _supports_native_batch_trial_creation(self) -> bool:
+        return True
+
+    def create_new_trials(
+        self,
+        study_id: int,
+        count: int,
+        template_trials: Sequence[FrozenTrial | None] | None = None,
+    ) -> list[int]:
+        return [
+            frozen_trial._trial_id
+            for frozen_trial in self._create_new_trials(study_id, count, template_trials)
+        ]
+
+    @staticmethod
+    def _create_frozen_trial_from_trial_model(
+        trial: "models.TrialModel", template_trial: FrozenTrial | None
+    ) -> FrozenTrial:
+        if template_trial:
+            frozen = copy.deepcopy(template_trial)
+            frozen.number = trial.number
+            frozen.datetime_start = trial.datetime_start
+            frozen._trial_id = trial.trial_id
+            return frozen
+        return FrozenTrial(
+            number=trial.number,
+            state=trial.state,
+            value=None,
+            values=None,
+            datetime_start=trial.datetime_start,
+            datetime_complete=None,
+            params={},
+            distributions={},
+            user_attrs={},
+            system_attrs={},
+            intermediate_values={},
+            trial_id=trial.trial_id,
+        )
+
     def _create_new_trial(
         self, study_id: int, template_trial: FrozenTrial | None = None
     ) -> FrozenTrial:
@@ -477,29 +516,17 @@ class RDBStorage(BaseStorage, BaseHeartbeat):
 
         """
 
-        def _create_frozen_trial(
-            trial: "models.TrialModel", template_trial: FrozenTrial | None
-        ) -> FrozenTrial:
-            if template_trial:
-                frozen = copy.deepcopy(template_trial)
-                frozen.number = trial.number
-                frozen.datetime_start = trial.datetime_start
-                frozen._trial_id = trial.trial_id
-                return frozen
-            return FrozenTrial(
-                number=trial.number,
-                state=trial.state,
-                value=None,
-                values=None,
-                datetime_start=trial.datetime_start,
-                datetime_complete=None,
-                params={},
-                distributions={},
-                user_attrs={},
-                system_attrs={},
-                intermediate_values={},
-                trial_id=trial.trial_id,
-            )
+        return self._create_new_trials(study_id, 1, [template_trial])[0]
+
+    def _create_new_trials(
+        self,
+        study_id: int,
+        count: int,
+        template_trials: Sequence[FrozenTrial | None] | None = None,
+    ) -> list[FrozenTrial]:
+        """Create new trials and return :class:`~optuna.trial.FrozenTrial` instances."""
+
+        template_trials = self._validate_create_new_trials_args(count, template_trials)
 
         # Retry maximum five times. Deadlocks may occur in distributed environments.
         MAX_RETRIES = 5
@@ -509,8 +536,14 @@ class RDBStorage(BaseStorage, BaseHeartbeat):
                     # This lock is necessary because the trial creation is not an atomic operation
                     # and the calculation of trial.number is prone to race conditions.
                     models.StudyModel.find_or_raise_by_id(study_id, session, for_update=True)
-                    trial = self._get_prepared_new_trial(study_id, template_trial, session)
-                    return _create_frozen_trial(trial, template_trial)
+                    trials = [
+                        self._get_prepared_new_trial(study_id, template_trial, session)
+                        for template_trial in template_trials
+                    ]
+                    return [
+                        self._create_frozen_trial_from_trial_model(trial, template_trial)
+                        for trial, template_trial in zip(trials, template_trials)
+                    ]
             # sqlalchemy_exc.OperationalError is converted to ``StorageInternalError``.
             except optuna.exceptions.StorageInternalError as e:
                 # ``OperationalError`` happens either by (1) invalid inputs, e.g., too long string,

@@ -376,3 +376,57 @@ def test_create_new_trial_with_retries() -> None:
         trials = storage.get_all_trials(study_id)
         assert len(trials) == 1
         assert trials[0].number == 0
+
+
+def test_create_new_trials() -> None:
+    with create_test_storage("sqlite:///:memory:") as storage:
+        study_id = storage.create_new_study(directions=[StudyDirection.MINIMIZE])
+
+        trial_ids = storage.create_new_trials(study_id, 3)
+
+        trials = storage.get_all_trials(study_id)
+        assert len(trial_ids) == 3
+        assert len(set(trial_ids)) == 3
+        assert [trial._trial_id for trial in trials] == trial_ids
+        assert [trial.number for trial in trials] == [0, 1, 2]
+        assert [trial.state for trial in trials] == [TrialState.RUNNING] * 3
+
+
+def test_create_new_trials_with_retries() -> None:
+    with create_test_storage("sqlite:///:memory:") as storage:
+        study_id = storage.create_new_study(directions=[StudyDirection.MINIMIZE])
+
+        n_retries = 0
+
+        def mock_func(
+            study_id: int,
+            template_trial: FrozenTrial,
+            session: "sqlalchemy_orm.Session",
+        ) -> FrozenTrial:
+            nonlocal n_retries
+            n_retries += 1
+            trial = models.TrialModel(
+                study_id=study_id,
+                number=None,
+                state=TrialState.RUNNING,
+                datetime_start=datetime.now(),
+            )
+            session.add(trial)
+            session.flush()
+            trial.number = trial.count_past_trials(session)
+            session.add(trial)
+
+            if n_retries >= 5:
+                return trial
+            raise sqlalchemy_exc.OperationalError("xxx", "yyy", Exception())
+
+        with patch(
+            "optuna.storages._rdb.storage.RDBStorage._get_prepared_new_trial",
+            new=Mock(side_effect=mock_func),
+        ):
+            trial_ids = storage.create_new_trials(study_id, 2)
+
+        trials = storage.get_all_trials(study_id)
+        assert len(trial_ids) == 2
+        assert len(trials) == 2
+        assert [trial.number for trial in trials] == [0, 1]

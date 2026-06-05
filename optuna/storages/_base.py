@@ -249,6 +249,60 @@ class BaseStorage(abc.ABC):
         """
         raise NotImplementedError
 
+    def _supports_native_batch_trial_creation(self) -> bool:
+        """Return whether this storage creates trial batches in one native operation."""
+
+        return False
+
+    def _validate_create_new_trials_args(
+        self,
+        count: int,
+        template_trials: Sequence[FrozenTrial | None] | None,
+    ) -> list[FrozenTrial | None]:
+        if not isinstance(count, int):
+            raise TypeError("count must be an integer.")
+        if count <= 0:
+            raise ValueError("count must be a positive integer.")
+        if template_trials is None:
+            return [None] * count
+
+        template_trials = list(template_trials)
+        if len(template_trials) != count:
+            raise ValueError("template_trials must have the same length as count.")
+        return template_trials
+
+    def create_new_trials(
+        self,
+        study_id: int,
+        count: int,
+        template_trials: Sequence[FrozenTrial | None] | None = None,
+    ) -> list[int]:
+        """Create and add multiple new trials to a study.
+
+        Storage backends that do not override this method use a correctness fallback that calls
+        :meth:`create_new_trial` once per trial.
+
+        Args:
+            study_id:
+                ID of the study.
+            count:
+                Number of trials to create.
+            template_trials:
+                Templates for the created trials. If supplied, its length must match ``count``.
+
+        Returns:
+            IDs of the created trials in reservation order.
+
+        Raises:
+            :exc:`KeyError`:
+                If no study with the matching ``study_id`` exists.
+        """
+
+        template_trials = self._validate_create_new_trials_args(count, template_trials)
+        return [
+            self.create_new_trial(study_id, template_trial) for template_trial in template_trials
+        ]
+
     @abc.abstractmethod
     def set_trial_param(
         self,

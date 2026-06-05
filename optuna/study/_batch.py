@@ -9,6 +9,8 @@ from optuna.trial import TrialState
 
 
 if TYPE_CHECKING:
+    from optuna.samplers import BaseSampler
+    from optuna.storages import BaseStorage
     from optuna.trial import FrozenTrial
     from optuna.trial import Trial
 
@@ -25,6 +27,7 @@ class BatchFallbackMode(Enum):
 
     NONE = "none"
     REPEATED_SINGLE_TRIAL = "repeated_single_trial"
+    REPEATED_SINGLE_SUGGESTION = "repeated_single_suggestion"
     REPEATED_SINGLE_COMPLETION = "repeated_single_completion"
 
 
@@ -110,4 +113,20 @@ def fallback_batch_capability() -> BatchCapability:
     return BatchCapability(
         storage_batch_reservation=BatchCapabilityMode.FALLBACK,
         sampler_batch_suggestion=BatchCapabilityMode.FALLBACK,
+    )
+
+
+def get_batch_capability(storage: BaseStorage, sampler: BaseSampler) -> BatchCapability:
+    sample_batch = getattr(sampler, "sample_batch", None)
+    return BatchCapability(
+        storage_batch_reservation=(
+            BatchCapabilityMode.NATIVE
+            if storage._supports_native_batch_trial_creation()
+            else BatchCapabilityMode.FALLBACK
+        ),
+        sampler_batch_suggestion=(
+            BatchCapabilityMode.NATIVE
+            if callable(sample_batch)
+            else BatchCapabilityMode.FALLBACK
+        ),
     )

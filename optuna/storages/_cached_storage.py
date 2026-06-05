@@ -154,6 +154,25 @@ class _CachedStorage(BaseStorage, BaseHeartbeat):
             self._add_trials_to_cache(study_id, [frozen_trial])
         return trial_id
 
+    def _supports_native_batch_trial_creation(self) -> bool:
+        return self._backend._supports_native_batch_trial_creation()
+
+    def create_new_trials(
+        self,
+        study_id: int,
+        count: int,
+        template_trials: Sequence[FrozenTrial | None] | None = None,
+    ) -> list[int]:
+        if not self._backend._supports_native_batch_trial_creation():
+            return super().create_new_trials(study_id, count, template_trials)
+
+        frozen_trials = self._backend._create_new_trials(study_id, count, template_trials)
+        with self._lock:
+            if study_id not in self._studies:
+                self._studies[study_id] = _StudyInfo()
+            self._add_trials_to_cache(study_id, frozen_trials)
+        return [trial._trial_id for trial in frozen_trials]
+
     def set_trial_param(
         self,
         trial_id: int,

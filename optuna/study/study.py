@@ -32,6 +32,7 @@ from optuna.distributions import BaseDistribution
 from optuna.storages._heartbeat import is_heartbeat_enabled
 from optuna.study._batch import BatchAskMetadata
 from optuna.study._batch import BatchAskResult
+from optuna.study._batch import BatchCapabilityMode
 from optuna.study._batch import BatchFallbackMode
 from optuna.study._batch import BatchTellInput
 from optuna.study._batch import BatchTellMetadata
@@ -39,6 +40,7 @@ from optuna.study._batch import BatchTellOutcome
 from optuna.study._batch import BatchTellResult
 from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import fallback_batch_capability
+from optuna.study._batch import get_batch_capability
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study._constrained_optimization import _get_feasible_trials
 from optuna.study._multi_objective import _get_pareto_front_trials
@@ -650,17 +652,48 @@ class Study:
         if count <= 0:
             raise ValueError("count must be a positive integer.")
 
-        trial_handles: list[BatchTrialHandle] = []
+        if not self._thread_local.in_optimize_loop and is_heartbeat_enabled(self._storage):
+            optuna_warn("Heartbeat of storage is supposed to be used with Study.optimize.")
+
+        fixed_distributions = fixed_distributions or {}
+        fixed_distributions = {
+            key: _convert_old_distribution_to_new_distribution(dist)
+            for key, dist in fixed_distributions.items()
+        }
+
+        # Sync storage once for the batch reservation.
+        self._thread_local.cached_all_trials = None
+
+        trial_ids = []
         for _ in range(count):
-            trial = self.ask(fixed_distributions=fixed_distributions)
+            trial_id = self._pop_waiting_trial_id()
+            if trial_id is None:
+                break
+            trial_ids.append(trial_id)
+
+        n_new_trials = count - len(trial_ids)
+        if n_new_trials > 0:
+            trial_ids.extend(self._storage.create_new_trials(self._study_id, n_new_trials))
+
+        trial_handles: list[BatchTrialHandle] = []
+        for trial_id in trial_ids:
+            trial = optuna.Trial(self, trial_id)
+            for name, param in fixed_distributions.items():
+                trial._suggest(name, param)
             trial_handles.append(BatchTrialHandle(trial=trial, number=trial.number))
 
+        capability = get_batch_capability(self._storage, self.sampler)
+        fallback_mode = (
+            BatchFallbackMode.REPEATED_SINGLE_TRIAL
+            if capability.storage_batch_reservation is BatchCapabilityMode.FALLBACK
+            else BatchFallbackMode.REPEATED_SINGLE_SUGGESTION
+        )
         metadata = BatchAskMetadata(
             batch_id=uuid.uuid4().hex,
             requested_count=count,
             returned_count=len(trial_handles),
-            capability=fallback_batch_capability(),
-            fallback_mode=BatchFallbackMode.REPEATED_SINGLE_TRIAL,
+            capability=capability,
+            fallback_mode=fallback_mode,
         )
         return BatchAskResult(trial_handles=trial_handles, metadata=metadata)
 
