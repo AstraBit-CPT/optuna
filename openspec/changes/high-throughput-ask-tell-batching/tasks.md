@@ -12,7 +12,7 @@
 - [x] 2.2 Implement RDB-backed batch reservation with unique trial IDs and trial numbers allocated under one storage coordination round.
 - [x] 2.3 Add conservative fallback reservation behavior for storage backends without native batch support and label it as non-high-throughput.
 - [x] 2.4 Ensure reserved trial identities are durable before workers receive them.
-- [ ] 2.5 Add tests for unique trial IDs and trial numbers under concurrent batch reservation.
+- [x] 2.5 Add tests for unique trial IDs and trial numbers under concurrent batch reservation.
 
 ## 3. Pending-Aware Batch Suggestion
 

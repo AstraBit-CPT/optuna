@@ -1532,6 +1532,40 @@ def test_ask_batch_uses_native_storage_batch_reservation_with_cached_rdb() -> No
         assert result.metadata.capability.sampler_batch_suggestion is BatchCapabilityMode.FALLBACK
 
 
+def test_ask_batch_concurrent_reservation_allocates_unique_trial_identities() -> None:
+    n_workers = 4
+    batch_size = 3
+
+    with StorageSupplier("sqlite") as storage:
+        study = create_study(storage=storage)
+        study_name = study.study_name
+
+        def reserve_batch() -> list[tuple[int, int]]:
+            worker_study = load_study(study_name=study_name, storage=storage)
+            result = worker_study.ask_batch(batch_size)
+            return [(handle.number, handle.trial._trial_id) for handle in result.trial_handles]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = [executor.submit(reserve_batch) for _ in range(n_workers)]
+                reservations = [
+                    reservation
+                    for future in as_completed(futures)
+                    for reservation in future.result()
+                ]
+
+        expected_trial_count = n_workers * batch_size
+        trial_numbers = [number for number, _ in reservations]
+        trial_ids = [trial_id for _, trial_id in reservations]
+
+        assert len(reservations) == expected_trial_count
+        assert len(set(trial_numbers)) == expected_trial_count
+        assert len(set(trial_ids)) == expected_trial_count
+        assert sorted(trial_numbers) == list(range(expected_trial_count))
+        assert {trial.state for trial in study.trials} == {TrialState.RUNNING}
+
+
 def test_ask_batch_invalid_count() -> None:
     study = create_study()
 
