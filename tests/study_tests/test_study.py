@@ -1428,6 +1428,26 @@ def test_ask_batch_records_duplicate_suggestion_diagnostics() -> None:
     assert diagnostics.near_duplicate_threshold == 0.01
 
 
+def test_ask_batch_records_sampler_snapshot_id() -> None:
+    fixed_distributions = {"x": distributions.FloatDistribution(0, 1)}
+    study = create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+
+    with pytest.warns(ExperimentalWarning):
+        result0 = study.ask_batch(1, fixed_distributions=fixed_distributions)
+
+    snapshot_id0 = result0.metadata.sampler_snapshot_id
+    assert snapshot_id0 is not None
+    assert len(snapshot_id0) == 64
+    int(snapshot_id0, 16)
+
+    with pytest.warns(ExperimentalWarning):
+        study.tell_batch([BatchTellInput(result0.trials[0], values=1.0)])
+        result1 = study.ask_batch(1, fixed_distributions=fixed_distributions)
+
+    assert result1.metadata.sampler_snapshot_id is not None
+    assert result1.metadata.sampler_snapshot_id != snapshot_id0
+
+
 def test_ask_batch_uses_native_tpe_sampler_batch_for_fixed_search_space() -> None:
     fixed_distributions = {
         "x": distributions.FloatDistribution(0, 1),
@@ -1603,7 +1623,7 @@ def test_batch_candidate_queue_acquire_ready_candidate_without_refill() -> None:
             batch_size=2, max_queue_size=2, max_inflight=2
         )
     with pytest.warns(ExperimentalWarning):
-        queue.refill()
+        refill = queue.refill()
 
     with patch.object(study, "ask_batch", wraps=study.ask_batch) as ask_batch_mock:
         acquired = queue.acquire("worker-a")
@@ -1612,6 +1632,8 @@ def test_batch_candidate_queue_acquire_ready_candidate_without_refill() -> None:
     assert acquired.status is BatchQueueAcquireStatus.READY
     assert acquired.trial_handle is not None
     assert acquired.worker_id == "worker-a"
+    assert refill.ask_metadata is not None
+    assert acquired.sampler_snapshot_id == refill.ask_metadata.sampler_snapshot_id
     assert acquired.reservation_order == 0
     assert acquired.ready_count == 1
     assert acquired.inflight_count == 1
@@ -1783,7 +1805,10 @@ def test_batch_candidate_queue_recovers_ready_and_inflight_candidates() -> None:
             batch_size=2, max_queue_size=2, max_inflight=2
         )
     with pytest.warns(ExperimentalWarning):
-        queue.refill()
+        refill = queue.refill()
+    assert refill.ask_metadata is not None
+    sampler_snapshot_id = refill.ask_metadata.sampler_snapshot_id
+    assert sampler_snapshot_id is not None
 
     acquired = queue.acquire("worker-a")
     assert acquired.trial_handle is not None
@@ -1792,6 +1817,10 @@ def test_batch_candidate_queue_recovers_ready_and_inflight_candidates() -> None:
 
     for trial in study.trials:
         assert _BATCH_QUEUE_ENTRY_ATTR in trial.system_attrs
+        assert (
+            trial.system_attrs[_BATCH_QUEUE_ENTRY_ATTR]["sampler_snapshot_id"]
+            == sampler_snapshot_id
+        )
 
     with pytest.warns(ExperimentalWarning):
         recovered_queue = study.create_batch_candidate_queue(
@@ -1819,6 +1848,7 @@ def test_batch_candidate_queue_recovers_ready_and_inflight_candidates() -> None:
     assert reacquired.status is BatchQueueAcquireStatus.READY
     assert reacquired.trial_handle is not None
     assert reacquired.trial_handle.number == ready_trial_number
+    assert reacquired.sampler_snapshot_id == sampler_snapshot_id
 
 
 def test_batch_candidate_queue_recovery_is_scoped_by_queue_id() -> None:

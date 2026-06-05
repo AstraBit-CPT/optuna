@@ -44,7 +44,7 @@
 - [x] 6.1 Add an opt-in coordinator that fills a bounded ready queue from the batch primitive.
 - [x] 6.2 Enforce candidate queue size, maximum inflight trial count, maximum snapshot age, and backpressure.
 - [x] 6.3 Ensure worker dequeue from a non-empty ready queue does not perform storage trial creation or sampler suggestion on the worker request path.
-- [ ] 6.4 Persist or report batch ID, snapshot identifier, queue age, and reservation order for queued candidates.
+- [x] 6.4 Persist or report batch ID, snapshot identifier, queue age, and reservation order for queued candidates.
 - [x] 6.5 Add tests proving queue mode avoids repeated public `ask` calls while the ready queue is non-empty.
 
 ## 7. Cheap Generator Modes and Resource Scheduling

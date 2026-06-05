@@ -77,6 +77,7 @@ class BatchQueueAcquireResult:
     trial_handle: BatchTrialHandle | None
     worker_id: str | None
     batch_id: str | None
+    sampler_snapshot_id: str | None
     reservation_order: int | None
     queue_age: datetime.timedelta | None
     ready_count: int
@@ -124,6 +125,7 @@ class BatchQueueRecoveryResult:
 class _QueueEntry:
     queue_id: str
     batch_id: str
+    sampler_snapshot_id: str | None
     reservation_order: int
     queued_at: datetime.datetime
     fallback_mode: BatchFallbackMode
@@ -134,6 +136,7 @@ class _QueueEntry:
 class _QueuedCandidate:
     trial_handle: BatchTrialHandle
     batch_id: str
+    sampler_snapshot_id: str | None
     reservation_order: int
     queued_at: datetime.datetime
     fallback_mode: BatchFallbackMode
@@ -143,6 +146,7 @@ class _QueuedCandidate:
 class _InflightCandidate:
     trial_handle: BatchTrialHandle
     batch_id: str
+    sampler_snapshot_id: str | None
     reservation_order: int
     queued_at: datetime.datetime
     acquired_at: datetime.datetime
@@ -238,6 +242,7 @@ class BatchCandidateQueue:
             queue_entry = _QueueEntry(
                 queue_id=self._queue_id,
                 batch_id=ask_result.metadata.batch_id,
+                sampler_snapshot_id=ask_result.metadata.sampler_snapshot_id,
                 reservation_order=reservation_order,
                 queued_at=queued_at,
                 fallback_mode=ask_result.metadata.fallback_mode,
@@ -248,6 +253,7 @@ class BatchCandidateQueue:
                 _QueuedCandidate(
                     trial_handle=trial_handle,
                     batch_id=queue_entry.batch_id,
+                    sampler_snapshot_id=queue_entry.sampler_snapshot_id,
                     reservation_order=reservation_order,
                     queued_at=queued_at,
                     fallback_mode=queue_entry.fallback_mode,
@@ -285,6 +291,7 @@ class BatchCandidateQueue:
                 trial_handle=None,
                 worker_id=worker_id,
                 batch_id=candidate.batch_id,
+                sampler_snapshot_id=candidate.sampler_snapshot_id,
                 reservation_order=candidate.reservation_order,
                 queue_age=queue_age,
                 ready_count=len(self._ready),
@@ -299,6 +306,7 @@ class BatchCandidateQueue:
             _QueueEntry(
                 queue_id=self._queue_id,
                 batch_id=candidate.batch_id,
+                sampler_snapshot_id=candidate.sampler_snapshot_id,
                 reservation_order=candidate.reservation_order,
                 queued_at=candidate.queued_at,
                 fallback_mode=candidate.fallback_mode,
@@ -308,6 +316,7 @@ class BatchCandidateQueue:
         self._inflight[leased_handle.number] = _InflightCandidate(
             trial_handle=leased_handle,
             batch_id=candidate.batch_id,
+            sampler_snapshot_id=candidate.sampler_snapshot_id,
             reservation_order=candidate.reservation_order,
             queued_at=candidate.queued_at,
             acquired_at=now,
@@ -318,6 +327,7 @@ class BatchCandidateQueue:
             trial_handle=leased_handle,
             worker_id=worker_id,
             batch_id=candidate.batch_id,
+            sampler_snapshot_id=candidate.sampler_snapshot_id,
             reservation_order=candidate.reservation_order,
             queue_age=queue_age,
             ready_count=len(self._ready),
@@ -400,6 +410,7 @@ class BatchCandidateQueue:
                 _QueuedCandidate(
                     trial_handle=ready_handle,
                     batch_id=inflight_candidate.batch_id,
+                    sampler_snapshot_id=inflight_candidate.sampler_snapshot_id,
                     reservation_order=inflight_candidate.reservation_order,
                     queued_at=inflight_candidate.queued_at,
                     fallback_mode=inflight_candidate.fallback_mode,
@@ -410,6 +421,7 @@ class BatchCandidateQueue:
                 _QueueEntry(
                     queue_id=self._queue_id,
                     batch_id=inflight_candidate.batch_id,
+                    sampler_snapshot_id=inflight_candidate.sampler_snapshot_id,
                     reservation_order=inflight_candidate.reservation_order,
                     queued_at=inflight_candidate.queued_at,
                     fallback_mode=inflight_candidate.fallback_mode,
@@ -478,6 +490,7 @@ class BatchCandidateQueue:
                     _QueuedCandidate(
                         trial_handle=trial_handle,
                         batch_id=queue_entry.batch_id,
+                        sampler_snapshot_id=queue_entry.sampler_snapshot_id,
                         reservation_order=queue_entry.reservation_order,
                         queued_at=queue_entry.queued_at,
                         fallback_mode=queue_entry.fallback_mode,
@@ -487,6 +500,7 @@ class BatchCandidateQueue:
                 self._inflight[trial_handle.number] = _InflightCandidate(
                     trial_handle=trial_handle,
                     batch_id=queue_entry.batch_id,
+                    sampler_snapshot_id=queue_entry.sampler_snapshot_id,
                     reservation_order=queue_entry.reservation_order,
                     queued_at=queue_entry.queued_at,
                     acquired_at=queue_entry.acquired_at or queue_entry.queued_at,
@@ -538,6 +552,7 @@ class BatchCandidateQueue:
             trial_handle=None,
             worker_id=worker_id,
             batch_id=None,
+            sampler_snapshot_id=None,
             reservation_order=None,
             queue_age=None,
             ready_count=len(self._ready),
@@ -572,6 +587,7 @@ class BatchCandidateQueue:
         queue_entry_attrs = {
             "queue_id": queue_entry.queue_id,
             "batch_id": queue_entry.batch_id,
+            "sampler_snapshot_id": queue_entry.sampler_snapshot_id,
             "reservation_order": queue_entry.reservation_order,
             "queued_at": queue_entry.queued_at.isoformat(),
             "fallback_mode": queue_entry.fallback_mode.value,
@@ -618,6 +634,7 @@ def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
 
     queue_id = raw_queue_entry.get("queue_id")
     batch_id = raw_queue_entry.get("batch_id")
+    sampler_snapshot_id = raw_queue_entry.get("sampler_snapshot_id")
     reservation_order = raw_queue_entry.get("reservation_order")
     queued_at = raw_queue_entry.get("queued_at")
     fallback_mode = raw_queue_entry.get("fallback_mode")
@@ -625,6 +642,8 @@ def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
     if not isinstance(queue_id, str):
         return None
     if not isinstance(batch_id, str):
+        return None
+    if sampler_snapshot_id is not None and not isinstance(sampler_snapshot_id, str):
         return None
     if not isinstance(reservation_order, int):
         return None
@@ -649,6 +668,7 @@ def _get_batch_queue_entry(system_attrs: dict[str, Any]) -> _QueueEntry | None:
     return _QueueEntry(
         queue_id=queue_id,
         batch_id=batch_id,
+        sampler_snapshot_id=sampler_snapshot_id,
         reservation_order=reservation_order,
         queued_at=parsed_queued_at,
         fallback_mode=parsed_fallback_mode,

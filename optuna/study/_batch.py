@@ -7,12 +7,15 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from enum import Enum
+import hashlib
+import json
 import math
 from typing import Any
 from typing import TYPE_CHECKING
 import uuid
 
 from optuna.distributions import BaseDistribution
+from optuna.distributions import distribution_to_json
 from optuna.distributions import FloatDistribution
 from optuna.distributions import IntDistribution
 from optuna.trial import TrialState
@@ -81,6 +84,7 @@ class BatchAskMetadata:
     returned_count: int
     capability: BatchCapability
     fallback_mode: BatchFallbackMode
+    sampler_snapshot_id: str | None = None
     suggestion_diagnostics: BatchSuggestionDiagnostics | None = None
 
 
@@ -243,6 +247,29 @@ def calculate_batch_suggestion_diagnostics(
     )
 
 
+def calculate_sampler_snapshot_id(
+    sampler: object,
+    search_space: Mapping[str, BaseDistribution],
+    trials: Sequence[FrozenTrial],
+) -> str:
+    """Hash the visible sampler inputs used to produce one candidate batch."""
+
+    payload = {
+        "sampler_class": f"{sampler.__class__.__module__}.{sampler.__class__.__qualname__}",
+        "search_space": [
+            (name, json.loads(distribution_to_json(distribution)))
+            for name, distribution in sorted(search_space.items())
+        ],
+        "trials": [
+            _snapshot_trial(trial) for trial in sorted(trials, key=lambda trial: trial.number)
+        ],
+    }
+    serialized_payload = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=_json_fallback
+    )
+    return hashlib.sha256(serialized_payload.encode()).hexdigest()
+
+
 def get_batch_trial_lease(system_attrs: Mapping[str, Any]) -> BatchTrialLease | None:
     raw_lease = system_attrs.get(_BATCH_TRIAL_LEASE_ATTR)
     if not isinstance(raw_lease, Mapping):
@@ -342,3 +369,37 @@ def _normalize_numeric_param(value: Any, distribution: BaseDistribution) -> floa
         return None
 
     return (normalized_value - low) / span
+
+
+def _snapshot_trial(trial: FrozenTrial) -> dict[str, Any]:
+    return {
+        "number": trial.number,
+        "state": trial.state.name,
+        "values": trial.values,
+        "params": _normalize_json(trial.params),
+        "distributions": {
+            name: json.loads(distribution_to_json(distribution))
+            for name, distribution in sorted(trial.distributions.items())
+        },
+        "intermediate_values": _normalize_json(trial.intermediate_values),
+        "system_attrs": _normalize_json(
+            {
+                key: value
+                for key, value in trial.system_attrs.items()
+                if not key.startswith("batch:")
+            }
+        ),
+    }
+
+
+def _normalize_json(value: Any) -> Any:
+    try:
+        json.dumps(value, sort_keys=True, default=_json_fallback)
+    except TypeError:
+        return _json_fallback(value)
+    else:
+        return value
+
+
+def _json_fallback(value: Any) -> str:
+    return repr(value)

@@ -44,6 +44,7 @@ from optuna.study._batch import BatchTellStatus
 from optuna.study._batch import BatchTrialHandle
 from optuna.study._batch import BatchTrialLease
 from optuna.study._batch import calculate_batch_suggestion_diagnostics
+from optuna.study._batch import calculate_sampler_snapshot_id
 from optuna.study._batch import create_batch_trial_lease
 from optuna.study._batch import fallback_batch_capability
 from optuna.study._batch import get_batch_capability
@@ -695,6 +696,15 @@ class Study:
 
         # Sync storage once for the batch reservation.
         self._thread_local.cached_all_trials = None
+        sampler_snapshot_id = calculate_sampler_snapshot_id(
+            self.sampler,
+            fixed_distributions,
+            self._get_trials(
+                deepcopy=False,
+                states=(TrialState.COMPLETE, TrialState.PRUNED, TrialState.RUNNING),
+                use_cache=False,
+            ),
+        )
 
         trial_ids = []
         for _ in range(count):
@@ -742,6 +752,7 @@ class Study:
             returned_count=len(trial_handles),
             capability=capability,
             fallback_mode=fallback_mode,
+            sampler_snapshot_id=sampler_snapshot_id,
             suggestion_diagnostics=calculate_batch_suggestion_diagnostics(
                 [trial.params for trial in trials], fixed_distributions
             ),
